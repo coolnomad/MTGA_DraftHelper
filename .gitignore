@@ -1,0 +1,25 @@
+# data
+data/raw/*
+data/processed/*
+
+# python cache
+__pycache__/
+*.pyc
+
+# node/electron artifacts
+node_modules/
+dist/
+build/
+
+# models
+*.onnx
+*.pkl
+*.rds
+*.pt
+
+# environment
+.venv/
+.env
+
+# notebooks
+.ipynb_checkpoints/
