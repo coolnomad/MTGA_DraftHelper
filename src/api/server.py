@@ -220,7 +220,13 @@ async function updateAdvice(packCards, packNumber, pickNumber) {
     return;
   }
   const data = await res.json();
-  adviceDiv.innerText = "Recommendations: " + (data.recommendations || []).join(", ");
+  const recs = data.scored || [];
+  if (recs.length === 0) {
+    adviceDiv.innerText = "Advice unavailable";
+    return;
+  }
+  const top = recs.slice(0, 5).map(r => `${r.card} (${r.score.toFixed(3)})`).join(", ");
+  adviceDiv.innerText = "Recommendations: " + top;
 }
 </script>
 </body>
@@ -447,8 +453,12 @@ def recommend_pick(req: RecommendRequest):
         else:
             score = evaluate_deck(new_pool)
         scored.append((card, score))
-    ranked = [c for c, _ in sorted(scored, key=lambda kv: kv[1], reverse=True)]
-    return {"recommendations": ranked or req.pack_cards}
+    scored_sorted = sorted(scored, key=lambda kv: kv[1], reverse=True)
+    ranked = [c for c, _ in scored_sorted]
+    return {
+        "recommendations": ranked or req.pack_cards,
+        "scored": [{"card": c, "score": float(s)} for c, s in scored_sorted],
+    }
 
 
 @app.post("/score_deck")

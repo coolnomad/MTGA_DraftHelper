@@ -49,7 +49,7 @@ def run_table(policy_name: str, set_code: str = "FIN", seed: int = 0, log_picks:
                 "policy": policy_name,
                 "deck_effect": score,
                 "deck_bump": bump,
-                "deck_size": sum(deck.values()),
+                "deck_size": sum(deck.values()), 
                 "n_pool_cards": sum(pool.values()),
             }
         )
