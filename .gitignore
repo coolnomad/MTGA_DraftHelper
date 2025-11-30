@@ -23,3 +23,9 @@ build/
 
 # notebooks
 .ipynb_checkpoints/
+reports/
+models/deck_effect_xgb.json
+tests/tmp_decomposition/
+*.parquet
+*.pdf
+*.svg
