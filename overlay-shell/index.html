@@ -1,0 +1,39 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    html, body {
+      margin: 0; padding: 0; width: 100%; height: 100%;
+      background: transparent;
+      overflow: hidden;
+    }
+    #dragbar {
+      -webkit-app-region: drag;
+      height: 22px;
+      background: rgba(0, 0, 0, 0.25);
+      color: #fff;
+      font-family: Arial, sans-serif;
+      font-size: 12px;
+      line-height: 22px;
+      padding-left: 8px;
+      box-sizing: border-box;
+    }
+    #frame {
+      width: 100%;
+      height: calc(100% - 22px);
+      border: none;
+      background: transparent;
+    }
+  </style>
+</head>
+<body>
+  <div id="dragbar">MTGA Draft Overlay (drag here)</div>
+  <iframe id="frame" allowtransparency="true"></iframe>
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const url = params.get('url') || 'http://127.0.0.1:8001/overlay';
+    document.getElementById('frame').src = url;
+  </script>
+</body>
+</html>

@@ -16,6 +16,7 @@ from typing import Dict, List
 import gzip
 import json
 import os
+import sqlite3
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -43,7 +44,9 @@ if hasattr(bs_const, "DRAFT_START_STRINGS") and BOT_DRAFT_COMPACT not in bs_cons
     bs_const.DRAFT_START_STRINGS.append(BOT_DRAFT_COMPACT)
 
 # our models
-from deck_eval.evaluator import evaluate_deck
+import re
+
+from deck_eval.evaluator import evaluate_deck, evaluate_deck_bump, DeckEvaluator
 from hero_bot.hero_policy import _get_state_value_model
 from state_encoding.encoder import encode_state
 
@@ -63,6 +66,8 @@ state: Dict[str, object] = {
     "message": "waiting for draft",
     "log_path": None,
     "data_cards_path": None,
+    "card_db_path": None,
+    "cards_csv_path": None,
     "pack_number": None,
     "pick_number": None,
     "pack_cards": [],
@@ -72,6 +77,14 @@ state: Dict[str, object] = {
 }
 
 GRP_TO_NAME: Dict[str, str] = {}
+NAME_TO_SLUG: Dict[str, str] = {}
+SLUGS_WITH_INDEX: set = set()
+_DECK_EVAL = None
+
+
+def _slugify_name(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    return slug
 
 
 def _find_log_path() -> Path:
@@ -132,40 +145,146 @@ def _find_data_cards() -> Path | None:
     return existing[0]
 
 
-def _load_grp_to_name() -> Dict[str, str]:
-    """Parse data_cards*.mtga (gzip JSON) to build grpId->name mapping."""
-    path = _find_data_cards()
-    if not path:
+def _find_card_db() -> Path | None:
+    """Locate Raw_CardDatabase_*.mtga (SQLite) on common install paths."""
+    override = os.environ.get("MTGA_CARD_DB")
+    candidates: List[Path] = []
+    if override:
+        candidates.append(Path(override).expanduser())
+    drives = getattr(bs_const, "WINDOWS_DRIVES", ["C:/", "D:/", "E:/", "F:/"])
+    subpaths = [
+        Path("Program Files") / "Wizards of the Coast" / "MTGA" / "MTGA_Data" / "Downloads" / "Raw",
+        Path("Program Files (x86)") / "Wizards of the Coast" / "MTGA" / "MTGA_Data" / "Downloads" / "Raw",
+    ]
+    for drive in drives:
+        for sub in subpaths:
+            base = Path(drive) / sub
+            if base.exists():
+                candidates.extend(base.glob("Raw_CardDatabase_*.mtga"))
+    existing = [c for c in candidates if c.exists()]
+    if not existing:
+        return None
+    existing.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return existing[0]
+
+
+def _load_cards_csv() -> Dict[str, str]:
+    """Parse local 17Lands cards.csv (id->name)."""
+    csv_path = REPO_ROOT / "data" / "cards.csv"
+    if not csv_path.exists():
         return {}
     try:
-        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
-            data = json.load(f)
-        cards = data.get("cards", [])
-        mapping = {}
-        for card in cards:
-            grp = card.get("grpid") or card.get("grpId") or card.get("id")
-            name = card.get("TitleID") or card.get("titleId") or card.get("name")
-            # If titleId is numeric, try English localization when present.
-            if isinstance(name, int):
-                locs = card.get("localizedname") or card.get("localizedNames") or card.get("Localization")
-                if isinstance(locs, dict):
-                    name = locs.get("en") or locs.get("en_US") or name
-            if grp and name:
-                mapping[str(grp)] = str(name)
+        import csv
+
+        mapping: Dict[str, str] = {}
+        with csv_path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                gid = row.get("id")
+                name = row.get("name")
+                if gid and name:
+                    mapping[str(gid)] = name
         if mapping:
-            state["data_cards_path"] = str(path)
+            state["cards_csv_path"] = str(csv_path)
         return mapping
     except Exception:
         return {}
 
 
+def _load_grp_to_name() -> Dict[str, str]:
+    """Parse data_cards*.mtga (gzip JSON), Raw_CardDatabase_*.mtga (SQLite), then fallback to cards.csv for grpId->name."""
+    path = _find_data_cards()
+    mapping: Dict[str, str] = {}
+    if path:
+        try:
+            with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
+                data = json.load(f)
+            cards = data.get("cards", [])
+            for card in cards:
+                grp = card.get("grpid") or card.get("grpId") or card.get("id")
+                name = card.get("TitleID") or card.get("titleId") or card.get("name")
+                # If titleId is numeric, try English localization when present.
+                if isinstance(name, int):
+                    locs = card.get("localizedname") or card.get("localizedNames") or card.get("Localization")
+                    if isinstance(locs, dict):
+                        name = locs.get("en") or locs.get("en_US") or name
+                if grp and name:
+                    mapping[str(grp)] = str(name)
+            if mapping:
+                state["data_cards_path"] = str(path)
+        except Exception:
+            mapping = {}
+    # Try Raw_CardDatabase SQLite if mapping is still sparse.
+    if not mapping or len(mapping) < 100:
+        db_path = _find_card_db()
+        if db_path and db_path.exists():
+            try:
+                conn = sqlite3.connect(db_path)
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT c.GrpId, l.Loc FROM Cards c JOIN Localizations_enUS l ON c.TitleId = l.LocId"
+                )
+                for gid, name in cur.fetchall():
+                    if gid and name and str(gid) not in mapping:
+                        mapping[str(gid)] = str(name)
+                conn.close()
+                state["card_db_path"] = str(db_path)
+            except Exception:
+                pass
+    # Supplement with 17Lands cards.csv if needed.
+    if not mapping or len(mapping) < 100:  # fallback or augment
+        csv_map = _load_cards_csv()
+        mapping.update({k: v for k, v in csv_map.items() if k not in mapping})
+    try:
+        return mapping
+    except Exception:
+        return {}
+
+
+def _build_slug_maps():
+    """Populate NAME_TO_SLUG and SLUGS_WITH_INDEX from current GRP_TO_NAME and deck evaluator."""
+    global NAME_TO_SLUG, SLUGS_WITH_INDEX, _DECK_EVAL
+    NAME_TO_SLUG = {}
+    for gid, name in GRP_TO_NAME.items():
+        if not name:
+            continue
+        slug = _slugify_name(name)
+        NAME_TO_SLUG[name] = slug
+    try:
+        _DECK_EVAL = DeckEvaluator()
+        SLUGS_WITH_INDEX = set(_DECK_EVAL.name_to_idx.keys())
+    except Exception:
+        SLUGS_WITH_INDEX = set()
+
+
 def _score_pack(pack_cards: List[str], pool_counts: Dict[str, int], pack_no: int, pick_no: int) -> List[Dict[str, object]]:
     """Score pack cards with state-value model when available; fallback to evaluator."""
     model = _get_state_value_model()
+    # Build slugged pool for deck bump if we have a deck evaluator index.
+    slug_pool: Dict[str, int] = {}
+    for gid, cnt in pool_counts.items():
+        name = GRP_TO_NAME.get(gid)
+        if not name:
+            continue
+        slug = NAME_TO_SLUG.get(name)
+        if slug and slug in SLUGS_WITH_INDEX:
+            slug_pool[slug] = slug_pool.get(slug, 0) + cnt
+
     scored: List[Dict[str, object]] = []
     for card in pack_cards:
         new_pool = dict(pool_counts)
         new_pool[card] = new_pool.get(card, 0) + 1
+        # Bump calculation uses slugged names; skip if not known.
+        bump_score = None
+        name = GRP_TO_NAME.get(card)
+        slug = NAME_TO_SLUG.get(name) if name else None
+        if slug and slug in SLUGS_WITH_INDEX:
+            bump_pool = dict(slug_pool)
+            bump_pool[slug] = bump_pool.get(slug, 0) + 1
+            try:
+                bump_score = float(evaluate_deck_bump(bump_pool))
+            except Exception:
+                bump_score = None
         if model is not None:
             try:
                 vec = encode_state(new_pool, pack_no=pack_no, pick_no=pick_no)
@@ -177,7 +296,7 @@ def _score_pack(pack_cards: List[str], pool_counts: Dict[str, int], pack_no: int
                 score = float(evaluate_deck(new_pool))
             except Exception:
                 score = 0.0
-        scored.append({"card": card, "score": score})
+        scored.append({"card": card, "score": score, "bump": bump_score})
     # if all scores identical, keep pack order
     scores = [s["score"] for s in scored]
     if len(set(scores)) > 1:
@@ -196,8 +315,10 @@ def _scanner_loop():
     # Load grpId->name mapping once.
     global GRP_TO_NAME
     GRP_TO_NAME = _load_grp_to_name()
+    _build_slug_maps()
     if not GRP_TO_NAME:
-        state["message"] += " | card names unavailable (data_cards not found)"
+        extra = "card names unavailable (no data_cards/cards.csv mapping)"
+        state["message"] = f"{state.get('message') or 'waiting for draft'} | {extra}"
 
     scanner = ArenaScanner(str(log_path), DummySetList(), sets_location=bs_const.SETS_FOLDER, step_through=False)
     while True:
@@ -207,6 +328,7 @@ def _scanner_loop():
                     "status": "draft_detected",
                     "message": f"Draft detected: {scanner.event_string}",
                     "log_path": str(log_path),
+                    "cards_csv_path": state.get("cards_csv_path"),
                     "pack_number": None,
                     "pick_number": None,
                     "pack_cards": [],
@@ -230,6 +352,7 @@ def _scanner_loop():
                         "message": "updated",
                         "log_path": str(log_path),
                         "data_cards_path": state.get("data_cards_path"),
+                        "cards_csv_path": state.get("cards_csv_path"),
                         "pack_number": pack_no,
                         "pick_number": pick_no,
                         "pack_cards": pack_cards,
@@ -297,9 +420,15 @@ async function poll() {
       const name = r.name || r.card;
       const id = r.card;
       const idText = id && id !== name ? ` <span class="id">${id}</span>` : '';
-      return `<div class="card">${name}${idText} <span class="score">${r.score.toFixed(3)}</span></div>`;
+      const bump = (r.bump !== null && r.bump !== undefined) ? ` <span class="score">bump ${r.bump.toFixed(3)}</span>` : '';
+      return `<div class="card">${name}${idText} <span class="score">${r.score.toFixed(3)}</span>${bump}</div>`;
     }).join('');
-    document.getElementById('path').innerText = `${data.log_path ? `Log: ${data.log_path}` : ''}${data.data_cards_path ? ` | Cards: ${data.data_cards_path}` : ''}`;
+    const paths = [];
+    if (data.log_path) paths.push(`Log: ${data.log_path}`);
+    if (data.data_cards_path) paths.push(`data_cards: ${data.data_cards_path}`);
+    if (data.card_db_path) paths.push(`card_db: ${data.card_db_path}`);
+    if (data.cards_csv_path) paths.push(`cards.csv: ${data.cards_csv_path}`);
+    document.getElementById('path').innerText = paths.join(' | ');
   } catch (e) {
     document.getElementById('status').innerText = 'Error fetching state';
   }

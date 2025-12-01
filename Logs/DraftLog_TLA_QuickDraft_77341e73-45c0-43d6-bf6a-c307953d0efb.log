@@ -10,3 +10,11 @@
 
 <30112025 17:10:20>,{"CurrentModule":"BotDraft","Payload":"{\"Result\":\"Success\",\"EventName\":\"QuickDraft_TLA_20251127\",\"DraftStatus\":\"PickNext\",\"PackNumber\":0,\"PickNumber\":0,\"NumCardsToPick\":1,\"DraftPack\":[\"97410\",\"97307\",\"97466\",\"97530\",\"97457\",\"97367\",\"97323\",\"97535\",\"97383\",\"97435\",\"97539\",\"97347\",\"97527\",\"97548\"],\"PackStyles\":[],\"PickedCards\":[],\"PickedStyles\":[]}"}
 
+<30112025 17:16:41>,[UnityCrossThreadLogger]==> BotDraftDraftStatus {"id":"77341e73-45c0-43d6-bf6a-c307953d0efb","request":"{\"EventName\":\"QuickDraft_TLA_20251127\"}"}
+
+<30112025 17:16:41>,{"CurrentModule":"BotDraft","Payload":"{\"Result\":\"Success\",\"EventName\":\"QuickDraft_TLA_20251127\",\"DraftStatus\":\"PickNext\",\"PackNumber\":0,\"PickNumber\":0,\"NumCardsToPick\":1,\"DraftPack\":[\"97410\",\"97307\",\"97466\",\"97530\",\"97457\",\"97367\",\"97323\",\"97535\",\"97383\",\"97435\",\"97539\",\"97347\",\"97527\",\"97548\"],\"PackStyles\":[],\"PickedCards\":[],\"PickedStyles\":[]}"}
+
+<30112025 17:34:59>,[UnityCrossThreadLogger]==> BotDraftDraftStatus {"id":"77341e73-45c0-43d6-bf6a-c307953d0efb","request":"{\"EventName\":\"QuickDraft_TLA_20251127\"}"}
+
+<30112025 17:34:59>,{"CurrentModule":"BotDraft","Payload":"{\"Result\":\"Success\",\"EventName\":\"QuickDraft_TLA_20251127\",\"DraftStatus\":\"PickNext\",\"PackNumber\":0,\"PickNumber\":0,\"NumCardsToPick\":1,\"DraftPack\":[\"97410\",\"97307\",\"97466\",\"97530\",\"97457\",\"97367\",\"97323\",\"97535\",\"97383\",\"97435\",\"97539\",\"97347\",\"97527\",\"97548\"],\"PackStyles\":[],\"PickedCards\":[],\"PickedStyles\":[]}"}
+

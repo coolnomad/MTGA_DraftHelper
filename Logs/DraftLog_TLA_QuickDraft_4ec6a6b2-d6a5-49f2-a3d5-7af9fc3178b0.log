@@ -1,0 +1,4 @@
+<30112025 20:13:24>,[UnityCrossThreadLogger]==> BotDraftDraftStatus {"id":"4ec6a6b2-d6a5-49f2-a3d5-7af9fc3178b0","request":"{\"EventName\":\"QuickDraft_TLA_20251127\"}"}
+
+<30112025 20:13:24>,{"CurrentModule":"BotDraft","Payload":"{\"Result\":\"Success\",\"EventName\":\"QuickDraft_TLA_20251127\",\"DraftStatus\":\"PickNext\",\"PackNumber\":0,\"PickNumber\":0,\"NumCardsToPick\":1,\"DraftPack\":[\"97410\",\"97307\",\"97466\",\"97530\",\"97457\",\"97367\",\"97323\",\"97535\",\"97383\",\"97435\",\"97539\",\"97347\",\"97527\",\"97548\"],\"PackStyles\":[],\"PickedCards\":[],\"PickedStyles\":[]}"}
+
