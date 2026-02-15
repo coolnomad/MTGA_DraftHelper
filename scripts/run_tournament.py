@@ -18,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(REPO_ROOT))
 
 from draft_env.env import DraftEnv
-from hero_bot.hero_policy import hero_policy
+from hero_bot.hero_policy import hero_policy, hero_policy_soft, hero_policy_distill
 from human_policy.bc_policy import make_bc_policy
 from human_policy.random_policy import random_policy
 from hero_bot.deck_builder import build_deck
@@ -28,6 +28,8 @@ from scripts.self_play_logger import log_picks
 
 POLICY_MAP = {
     "hero": hero_policy,
+    "hero_soft": hero_policy_soft,
+    "hero_distill": hero_policy_distill,
     "bc": make_bc_policy(),
     "random": random_policy,
 }

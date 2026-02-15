@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Pool Deckbuilder UI</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="title">Pool-Only Deckbuilder</div>
+      <div class="controls">
+        <label>Set <input id="setCode" value="FIN" /></label>
+        <label>Seed <input id="seed" type="number" value="1337" /></label>
+        <button id="startBtn">Load Random Pool</button>
+        <button id="rerollBtn" class="secondary">New Random Pool</button>
+        <button id="scoreBtn">Submit for Scoring</button>
+        <label class="toggle"><input type="checkbox" id="showCardImage" /> Card image</label>
+      </div>
+      <div class="status" id="status"></div>
+    </header>
+
+    <main>
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Main Deck</h2>
+          <span id="deckCount" class="chip">Cards: 0 / 40</span>
+        </div>
+        <div id="mainList" class="pool-list"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Pool / Sideboard</h2>
+          <span id="poolMeta" class="chip">Pool: --</span>
+        </div>
+        <div id="sideList" class="pool-list"></div>
+      </section>
+
+      <section class="panel basics-panel">
+        <div class="panel-head">
+          <h2>Basic Lands (Unlimited)</h2>
+        </div>
+        <div id="basicPalette" class="basic-palette"></div>
+      </section>
+
+      <section class="panel score-panel">
+        <div class="panel-head">
+          <h2>Model Score</h2>
+        </div>
+        <div id="scoreBox" class="score-box">
+          <div>`Submit for Scoring` to evaluate current main deck.</div>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

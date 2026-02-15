@@ -34,6 +34,7 @@ class PackMetrics:
     model_path: str
     n_train: int
     n_test: int
+    topk: List[float]
 
 
 def _build_examples(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[int]]:
@@ -46,8 +47,8 @@ def _build_examples(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[int]
     pack_lengths: List[int] = []
     for _, row in df.iterrows():
         state_vec = np.array(row["state_vec"], dtype=float)
-        card_feats = row["card_features"]
-        pack_cards = row["pack_cards"]
+        card_feats = list(row["card_features"])
+        pack_cards = list(row["pack_cards"])
         k = len(pack_cards)
         for card_name, feats in zip(pack_cards, card_feats):
             feat_vec = np.array(feats, dtype=float)
@@ -59,15 +60,16 @@ def _build_examples(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[int]
     return X, y, pack_lengths
 
 
-def _evaluate_model(model, X: np.ndarray, df: pd.DataFrame, pack_lengths: List[int]) -> Tuple[float, float, int]:
-    """Compute top-1 accuracy and avg log loss on a held-out set."""
+def _evaluate_model(model, X: np.ndarray, df: pd.DataFrame, pack_lengths: List[int]) -> Tuple[float, float, int, List[float]]:
+    """Compute top-1 accuracy, avg log loss, and top-k curve on a held-out set."""
     if len(df) == 0 or X.size == 0:
-        return 0.0, float("inf"), 0
+        return 0.0, float("inf"), 0, []
 
     probs_all = model.predict_proba(X)[:, 1]
     top1 = 0
     total = 0
     logloss = 0.0
+    topk_counts = [0] * 14  # up to 14 cards in pack
     idx = 0
     for (_, row), k in zip(df.iterrows(), pack_lengths):
         pack_probs = probs_all[idx: idx + k]
@@ -76,16 +78,34 @@ def _evaluate_model(model, X: np.ndarray, df: pd.DataFrame, pack_lengths: List[i
             pack_probs = pack_probs / pack_probs.sum()
         else:
             pack_probs = np.full(k, 1.0 / k)
-        human_idx = row["pack_cards"].index(row["human_pick"]) if row["human_pick"] in row["pack_cards"] else None
+        pack_cards = list(row["pack_cards"])
+        human_idx = pack_cards.index(row["human_pick"]) if row["human_pick"] in pack_cards else None
         if human_idx is not None:
             if int(np.argmax(pack_probs)) == human_idx:
                 top1 += 1
             logloss -= np.log(max(pack_probs[human_idx], 1e-9))
+            # top-k curve
+            rank = int(np.argsort(pack_probs)[::-1].tolist().index(human_idx))
+            for kk in range(min(k, len(topk_counts))):
+                if rank <= kk:
+                    topk_counts[kk] += 1
             total += 1
         idx += k
     if total == 0:
-        return 0.0, float("inf"), 0
-    return top1 / total, logloss / total, total
+        return 0.0, float("inf"), 0, []
+    topk_acc = [c / total for c in topk_counts]
+    return top1 / total, logloss / total, total, topk_acc
+
+
+class ConstantModel:
+    """Pickleable constant-probability model."""
+
+    def __init__(self, prob: float):
+        self.prob = prob
+
+    def predict_proba(self, X):
+        n = X.shape[0]
+        return np.tile([1 - self.prob, self.prob], (n, 1))
 
 
 def _fit_model(train_df: pd.DataFrame) -> Tuple[object, np.ndarray]:
@@ -94,15 +114,6 @@ def _fit_model(train_df: pd.DataFrame) -> Tuple[object, np.ndarray]:
     if X_train.size == 0 or len(np.unique(y_train)) < 2:
         # constant model that ignores input shape
         p = float(np.mean(y_train)) if len(y_train) else 0.5
-
-        class ConstantModel:
-            def __init__(self, prob: float):
-                self.prob = prob
-
-            def predict_proba(self, X):
-                n = X.shape[0]
-                return np.tile([1 - self.prob, self.prob], (n, 1))
-
         return ConstantModel(p), X_train
     model = LogisticRegression(
         max_iter=200,
@@ -143,7 +154,7 @@ def train_models(df_override: Optional[pd.DataFrame] = None, seed: int = 1337, t
         _, y_train, _ = _build_examples(train_df)
 
         X_test, _, pack_lengths = _build_examples(test_df)
-        top1, logloss, n_picks = _evaluate_model(model, X_test, test_df, pack_lengths)
+        top1, logloss, n_picks, topk = _evaluate_model(model, X_test, test_df, pack_lengths)
 
         bucket_slug = bucket.replace(" ", "_")
         model_path = MODEL_DIR / f"human_policy_{bucket_slug}.pkl"
@@ -156,6 +167,7 @@ def train_models(df_override: Optional[pd.DataFrame] = None, seed: int = 1337, t
             model_path=str(model_path),
             n_train=len(train_df),
             n_test=len(test_df),
+            topk=topk,
         )
     return results
 
@@ -199,5 +211,14 @@ def score_pack(
 
 
 if __name__ == "__main__":
-    metrics = train_models()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", type=str, default=str(INPUT_PATH), help="Path to bc_tensors parquet.")
+    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--test_frac", type=float, default=0.1)
+    args = parser.parse_args()
+
+    df_in = pd.read_parquet(args.input)
+    metrics = train_models(df_override=df_in, seed=args.seed, test_frac=args.test_frac)
     print(json.dumps({k: vars(v) for k, v in metrics.items()}, indent=2))

@@ -1,0 +1,6 @@
+{
+  "temperature": 0.25,
+  "max_rows": 2000,
+  "input_path": "data\\processed\\bc_dataset_sample_5k.parquet",
+  "model_path": "C:\\GitHub\\MTGA_DraftHelper\\hero_bot\\models\\hero_policy_distill.pkl"
+}

@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Pod Draft UI</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="topbar">
+      <div class="title">Pod Draft vs Bots</div>
+      <div class="controls">
+        <label>Format <input id="format" value="FIN" /></label>
+        <label>Seed <input id="seed" type="number" value="1337" /></label>
+        <label>Human Seat <input id="humanSeat" type="number" min="0" max="7" value="0" /></label>
+        <label>Bots (7, comma) <input id="bots" value="hero,hero,hero,hero,hero,hero,hero" /></label>
+        <button id="startBtn">Start Session</button>
+        <label class="toggle"><input type="checkbox" id="showCardImage" /> Card image</label>
+        <label class="slider">Card size <input id="cardSize" type="range" min="140" max="260" step="10" value="160" /></label>
+      </div>
+      <div class="status" id="status"></div>
+    </div>
+    <main id="draftView">
+      <section class="pack">
+        <h2 id="packTitle">Pack</h2>
+        <div id="packGrid" class="card-grid"></div>
+      </section>
+      <section class="pool">
+        <div class="pool-header">
+          <h2>Pool (Drafting)</h2>
+          <div class="deck-stats">
+            <span id="deckEffect">Effect: --</span>
+            <span id="deckBump">Bump: --</span>
+          </div>
+        </div>
+        <div id="poolList" class="pool-list"></div>
+        <h3>Sideboard</h3>
+        <div id="sideList" class="pool-list"></div>
+      </section>
+    </main>
+
+    <main id="deckView" class="hidden">
+      <section class="deck-builder">
+        <div class="builder-header">
+          <div>
+            <h2>Deck Builder</h2>
+            <p class="helper">Click cards to move between sideboard and main deck.</p>
+          </div>
+          <div class="deck-stats">
+            <span id="deckCountBuilder">Cards: --</span>
+            <span id="deckEffectBuilder">Effect: --</span>
+            <span id="deckBumpBuilder">Bump: --</span>
+          </div>
+        </div>
+        <div class="builder-row">
+          <div class="deck-header">
+            <h3>Basic Lands</h3>
+            <span class="hint">Unlimited</span>
+          </div>
+          <div id="basicPalette" class="basic-palette"></div>
+        </div>
+        <div class="builder-row">
+          <div class="builder-column">
+            <div class="deck-header">
+              <h3>Sideboard (pool)</h3>
+              <span class="hint">Top</span>
+            </div>
+            <div id="deckSideList" class="pool-list"></div>
+          </div>
+        </div>
+        <div class="builder-row">
+          <div class="deck-header">
+            <h3>Main Deck</h3>
+            <span class="hint">Bottom</span>
+          </div>
+          <div id="deckMainList" class="pool-list"></div>
+        </div>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

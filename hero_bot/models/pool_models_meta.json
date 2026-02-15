@@ -1,0 +1,80 @@
+{
+  "input": "C:\\GitHub\\MTGA_DraftHelper\\data\\processed\\bc_dataset.parquet",
+  "max_rows": 4095462,
+  "n_samples": 97511,
+  "seed": 1337,
+  "feature_dim": 364,
+  "effect_model": "C:\\GitHub\\MTGA_DraftHelper\\hero_bot\\models\\pool_effect.pkl",
+  "bump_model": "C:\\GitHub\\MTGA_DraftHelper\\hero_bot\\models\\pool_bump.pkl",
+  "metrics": {
+    "cv_folds": 5,
+    "effect": {
+      "cv": {
+        "raw_r2": 0.9809319815586681,
+        "raw_rmse": 1.3983824875829498e-08,
+        "bin_r2": NaN,
+        "bin_rmse": NaN,
+        "slope": 0.49999998624333547,
+        "intercept": 0.2541372110068066,
+        "bins_path": "reports\\pool_effect_cv_bins.csv",
+        "calibration_svg": "reports\\pool_effect_cv_calibration.svg",
+        "n_bins": 20
+      },
+      "train": {
+        "raw_r2": 0.9809319815586681,
+        "raw_rmse": 1.3983824875829498e-08,
+        "bin_r2": NaN,
+        "bin_rmse": NaN,
+        "slope": 0.49999998624333547,
+        "intercept": 0.2541372110068066,
+        "bins_path": "reports\\pool_effect_train_bins.csv",
+        "calibration_svg": "reports\\pool_effect_train_calibration.svg",
+        "n_bins": 20
+      },
+      "oof_2fold": {
+        "raw_r2": 0.9809319815586681,
+        "raw_rmse": 1.3983824875829498e-08,
+        "bin_r2": NaN,
+        "bin_rmse": NaN,
+        "slope": 0.49999998624333547,
+        "intercept": 0.2541372110068066
+      }
+    },
+    "bump": {
+      "cv": {
+        "raw_r2": 1.0,
+        "raw_rmse": 0.0,
+        "bin_r2": NaN,
+        "bin_rmse": NaN,
+        "slope": 0.5000000000002477,
+        "intercept": 0.0032041016966091545,
+        "bins_path": "reports\\pool_bump_cv_bins.csv",
+        "calibration_svg": "reports\\pool_bump_cv_calibration.svg",
+        "n_bins": 20
+      },
+      "train": {
+        "raw_r2": 1.0,
+        "raw_rmse": 0.0,
+        "bin_r2": NaN,
+        "bin_rmse": NaN,
+        "slope": 0.5000000000002477,
+        "intercept": 0.0032041016966091545,
+        "bins_path": "reports\\pool_bump_train_bins.csv",
+        "calibration_svg": "reports\\pool_bump_train_calibration.svg",
+        "n_bins": 20
+      },
+      "oof_2fold": {
+        "raw_r2": 1.0,
+        "raw_rmse": 0.0,
+        "bin_r2": NaN,
+        "bin_rmse": NaN,
+        "slope": 0.5000000000002477,
+        "intercept": 0.0032041016966091545
+      }
+    }
+  },
+  "artifacts": {
+    "oof_2fold_parquet": "reports\\pool_value_oof_2fold.parquet",
+    "oof_2fold_csv": "reports\\pool_value_oof_2fold.csv"
+  }
+}

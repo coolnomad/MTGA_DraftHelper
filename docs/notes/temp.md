@@ -141,3 +141,213 @@ Electron overlay shell added:
 
 Deck bump surfaced in overlay:
 - live_overlay.py now slugifies card names, maps grpIds to names, and when possible computes deck bump via deck_eval.evaluate_deck_bump using slugged pool counts. Recommendations include a bump field (shown alongside the score).
+
+2025-12-01 offline focus:
+- Model quality: retrain/validate state-value and deck-effect/bump models on a representative sample; add a small hyperparam sweep, draft_id-based split, and log metrics; ensure target columns are present to avoid evaluator fallback.
+- Deck builder integration: add a live /deck endpoint (using hero_bot/deck_builder.py or a fast heuristic) to suggest best deck + curve from current pool; add a smoke test.
+- Data hygiene: add checks for model artifacts (deck_effect_xgb.json/meta, cards_index.json) and card mappings; add a reload for name/slug maps.
+- Set data: optionally build/import set files or MTGA card DB locally to enrich metadata (colors/rarity/types).
+- Tests/tooling: add quick tests for /state (mock pack/pool), deck bump calculation, and model load/predict; consider a minimal CI/script to run them.
+- Performance: profile/optimize encode_state and deck scoring (cache card features, chunk/parallelize) to reduce per-row Python overhead.
+
+2025-12-01 notes (recent Q&A):
+- Human policy metrics were degenerate because the sample is tiny/imbalanced; it doesn’t use deck bump/effect at all—just pick probabilities from human choices.
+- Human policy trains per skill bucket (plus ALL); you choose which bucket model to use at inference. Without specifying, you’d use ALL (average). No automatic shift unless you pick a bucket (e.g., high-skill => use the matching model).
+- Hero/state-value model trained on the 5k sample: R2≈0.0763, RMSE≈0.0476 in ~68s; human policy training now saves models after fixing a pickling bug (ConstantModel moved to module scope).
+
+Deck bump overfit concern (clarification needed):
+- The `deck_effect`/`deck_bump` in bc_dataset_sample_5k_with_effect.parquet come from the fixed deck_eval model. If the concern is overfitting that model, we’d need to retrain it; otherwise, to avoid in-sample labels for hero training, we can generate out-of-fold (OOF) `deck_effect_oof`/`deck_bump_oof` via a 2-fold split: train deck-effect on half, predict the other half, swap, write OOF columns, then train state-value on those. Need confirmation whether to (1) retrain deck_eval in folds, or (2) produce OOF labels from this parquet (which would differ from shipped deck_eval).
+
+2025-12-01 OOF deck_effect/bump:
+- Added two-fold OOF generation in scripts/deck_effect_model.py; fold models saved under models/fold_models/deck_effect_xgb_foldA/B + meta.
+- Generated reports/deck_effect_oof.parquet (n=77,867) with columns draft_id, deck_effect_oof, deck_bump_oof. Main deck_eval artifacts not overwritten.
+- hero_bot/train_state_value.py now accepts --oof_labels and --oof_target_column to merge OOF labels (by draft_id) and train on them. Use: `python hero_bot/train_state_value.py --input data/processed/bc_dataset_sample_5k_with_effect.parquet --oof_labels reports/deck_effect_oof.parquet --oof_target_column deck_effect_oof`.
+
+2025-12-01 hero train (OOF target):
+- Command: `python hero_bot/train_state_value.py --input data/processed/bc_dataset_sample_5k_with_effect.parquet --oof_labels reports/deck_effect_oof.parquet --oof_target_column deck_effect_oof --max_rows 50000 --n_jobs -1`
+- Metrics: R2=0.0121, RMSE=0.0738, n_train=31,918; n_test=8,031; model saved to hero_bot/models/state_value.pkl.
+- Interpretation: training on OOF deck_effect labels avoids in-sample leakage but yields modest fit (very low R2, higher RMSE than prior in-sample run). Could try deck_bump_oof as target, larger sample, or feature/model tweaks to improve.
+
+2025-12-01 hero train (OOF bump target):
+- Command: `python hero_bot/train_state_value.py --input data/processed/bc_dataset_sample_5k_with_effect.parquet --oof_labels reports/deck_effect_oof.parquet --oof_target_column deck_bump_oof --max_rows 50000 --n_jobs -1`
+- Metrics: R2=0.0606, RMSE=0.0363, n_train=31,918; n_test=8,031; model saved to hero_bot/models/state_value.pkl (overwrites prior).
+- Interpretation: OOF bump target fits better than OOF deck_effect (higher R2, lower RMSE). Still modest; consider more data/hyperparam tuning if higher fidelity needed.
+
+2025-12-01 hero train (OOF net deck_effect target):
+- Command: `python hero_bot/train_state_value.py --input data/processed/bc_dataset_sample_5k_with_effect.parquet --oof_labels reports/deck_effect_oof.parquet --oof_target_column deck_effect_oof --max_rows 50000 --n_jobs -1`
+- Metrics: R2=0.0121, RMSE=0.0738, n_train=31,918; n_test=8,031; calibration slope≈0.561, intercept≈0.236; bins at reports/state_value_bins_deck_effect_oof.csv; SVG at reports/state_value_calibration_deck_effect_oof.svg. Model saved to hero_bot/models/state_value.pkl (overwrites prior).
+- Interpretation: Net OOF target remains weak fit (low R2, higher RMSE) and under-calibrated (slope<1). Bump target still preferable. Binned calibration R2≈0.446 (true_mean vs pred_mean).
+
+Calibration bin R2:
+- deck_bump_oof bins: R2≈0.847
+- deck_effect_oof bins: R2≈0.446
+
+2025-12-01 human policy train on 5k tensors:
+- Rebuilt tensors from bc_dataset_sample_5k_with_effect.parquet: `python human_policy/bc_dataset_builder.py --input data/processed/bc_dataset_sample_5k_with_effect.parquet --output data/processed/bc_tensors_5k.parquet` (210k rows; human_pick/pack_cards slugged).
+- Trained human policy on bc_tensors_5k: `PYTHONPATH=. python human_policy/train_human_policy.py --input data/processed/bc_tensors_5k.parquet`
+- Metrics (top1_acc ~0.22–0.24, log_loss ~1.79–1.81):
+  - ALL: top1=0.229, log_loss=1.804, n_picks=21,000 (n_train=189k/n_test=21k)
+  - platinum: top1=0.219, log_loss=1.791, n_picks=7,644
+  - diamond: top1=0.224, log_loss=1.783, n_picks=3,667
+  - gold: top1=0.240, log_loss=1.799, n_picks=2,924
+  - silver: top1=0.240, log_loss=1.785, n_picks=2,004
+  - bronze: top1=0.223, log_loss=1.811, n_picks=1,059
+  - mythic: top1=0.216, log_loss=1.812, n_picks=1,974
+  - UNKNOWN: top1=0.229, log_loss=1.797, n_picks=1,731
+
+2025-12-01 human policy train:
+- Command: `PYTHONPATH=. python human_policy/train_human_policy.py --input data/processed/bc_tensors.parquet`
+- Metrics remain degenerate on the tiny tensor sample: top1_acc=0, log_loss=Inf, n_picks=0 across buckets (UNKNOWN/bronze/silver/gold/platinum/diamond/mythic/ALL). Models saved under human_policy/models/*. This indicates insufficient/imbalanced data; need larger/cleaner tensors for meaningful human pick models.
+
+2025-12-02 plan (hero full, chunked):
+- Goal: train hero/state-value on full bc_dataset.parquet (~4.1M rows, ~97k drafts) using OOF labels (77,867 drafts in deck_effect_oof); inner-join on draft_id to drop missing. Target: deck_bump_oof.
+- Method: add chunked encoder (encode_state) writing features/targets to disk in batches; train XGBoost by streaming chunks (bounded memory). Save raw+20-bin metrics and calibration plots.
+- Metrics to record (raw and 20-bin): R2, RMSE, slope, intercept; save bins CSV and SVG under reports/state_value_*_full. Also record wall-clock runtime.
+- Steps:
+  1) Implement chunked encoding of merged df (bc_dataset ∩ deck_effect_oof), write temp chunk files.
+  2) Train XGBoost on streamed chunks.
+  3) Compute metrics + 20-bin calibration; save bins CSV/SVG; log runtime.
+
+2025-12-02 hero full attempt:
+- Implemented scripts/train_hero_chunked.py to merge bc_dataset with deck_effect_oof (inner join on draft_id), encode in chunks to npy, stream into XGBoost, and save metrics/bins/SVG/runtime.
+- Merge size: ~3,270,414 rows, 77,867 drafts (only drafts with OOF labels).
+- Run failed due to PermissionError writing first chunk to system temp (C:\Users\dimuc\AppData\Local\Temp\hero_chunks_...).
+- Next step: redirect chunk output to a writable path (e.g., Temp/hero_chunks under the repo or set TMPDIR/TEMP env) and rerun the chunked training; then record metrics (raw + 20-bin R2/RMSE/slope/intercept) and runtime to reports + temp.md.
+
+2025-12-02 hero full train (chunked, deck_bump_oof target):
+- Chunk path redirected to data/hero_chunks; full merge rows=3,270,414 across 77,867 drafts; target deck_bump_oof.
+- Command: `PYTHONPATH=. python scripts/train_hero_chunked.py` (batch encoder + XGBoost hist).
+- Metrics (raw): R2=0.1260, RMSE=0.0345, slope=1.1010, intercept=0.00079.
+- 20-bin calibration: bins_R2=0.9923, bins_RMSE=0.00111; bins at reports/state_value_bins_full.csv; SVG at reports/state_value_calibration_full.svg.
+- Rows trained: 3,270,414; runtime ≈ 2,789 seconds (~46.5 minutes). Model saved to hero_bot/models/state_value.pkl.
+- Tournament smoke (hero policy with new model): `PYTHONPATH=. python scripts/run_tournament.py --games 1 --policy hero` → deck_effect mean ~0.379 across 8 seats (reports/tournament_hero.parquet).
+
+2025-12-02 roadmap status:
+- Hero bot: trained on full data with OOF deck_bump_oof; strong calibration, modest R2. Model deployed in overlay and sim drafts.
+- Human bot: trained on 5k tensors (0.22–0.24 top1, log_loss ~1.8); better than tiny sample but still weak; needs richer tensors/encoding for higher fidelity.
+- Overlay: live pack/pool ingest, name mapping (data_cards/raw DB/17Lands), bump scores displayed; Electron on-top wrapper with drag/opacity/hotkeys.
+- OOF deck effect/bump: 2-fold labels generated (reports/deck_effect_oof.parquet), fold models saved separately.
+- Next/high-value items: add /deck endpoint with live deck builder; improve human policy with richer tensors; further hero tuning (hyperparams, features) if needed; integrate deck summaries into overlay; add tests/CI for /state, model load, and recommend_pick.
+
+2025-12-02 human policy train on full bc_dataset:
+- Rebuilt tensors from full bc_dataset.parquet: `PYTHONPATH=. python human_policy/bc_dataset_builder.py --input data/processed/bc_dataset.parquet --output data/processed/bc_tensors_full.parquet` (4,095,462 rows, 97,511 drafts).
+- Trained human policy on bc_tensors_full: `PYTHONPATH=. python human_policy/train_human_policy.py --input data/processed/bc_tensors_full.parquet` (~23 min observed).
+- Metrics (top1_acc ~0.223–0.229, log_loss ~1.797–1.800):
+  - ALL: top1=0.2230, log_loss=1.7992, n_picks=409,547 (n_train=3,685,915/n_test=409,547); topk (k=1..14): [0.255, 0.358, 0.414, 0.439, 0.443, 0.433, 0.413, 0.386, 0.349, 0.306, 0.257, 0.201, 0.139, 0.072]
+  - platinum: top1=0.2233, log_loss=1.7983, n_picks=147,689; topk≈[0.255,0.358,0.413,0.437,0.442,0.433,0.412,0.384,0.350,0.307,0.257,0.202,0.138,0.071]
+  - diamond: top1=0.2227, log_loss=1.7985, n_picks=70,842; topk≈[0.255,0.359,0.416,0.439,0.443,0.432,0.413,0.385,0.350,0.308,0.258,0.202,0.140,0.072]
+  - gold: top1=0.2250, log_loss=1.7984, n_picks=57,948; topk≈[0.253,0.356,0.413,0.437,0.443,0.434,0.414,0.386,0.349,0.307,0.258,0.199,0.138,0.070]
+  - silver: top1=0.2259, log_loss=1.7999, n_picks=40,026; topk≈[0.252,0.355,0.413,0.438,0.440,0.433,0.410,0.382,0.348,0.303,0.254,0.202,0.139,0.071]
+  - bronze: top1=0.2293, log_loss=1.7973, n_picks=19,770; topk≈[0.255,0.356,0.411,0.436,0.440,0.432,0.414,0.386,0.348,0.308,0.260,0.205,0.140,0.072]
+  - mythic: top1=0.2224, log_loss=1.7979, n_picks=39,661; topk≈[0.256,0.361,0.416,0.439,0.441,0.431,0.409,0.382,0.349,0.305,0.259,0.202,0.139,0.070]
+  - UNKNOWN: top1=0.2235, log_loss=1.8002, n_picks=33,613; topk≈[0.252,0.352,0.411,0.441,0.442,0.432,0.412,0.385,0.352,0.307,0.261,0.205,0.139,0.074]
+
+2025-12-02 ingestion helper:
+- Added scripts/build_bc_dataset_from_raw.py to build bc_dataset_full.parquet directly from draft_data_public*.csv.gz (wide one-hot pack_/pool_ columns). Slugifies card names, builds pack_card_ids/pool_counts/human_pick, keeps metadata (pack_number/pick_number/rank/buckets).
+
+2025-12-02 run_pod_human spec -> work items:
+- Need a new scripts/run_pod_human.py that runs an 8-seat draft with 1 human seat + 7 bot policies, packs generated locally (L/R/L passing), logs per-pick and summary to parquet, and optional replay.
+- Define a DraftPolicy interface (pick(pack_card_ids, pool_counts, pack_number, pick_number, seat_idx, meta)) and adapters for hero, human_policy, random.
+- Use DraftEnv if compatible; otherwise implement pack generation and pass/pick loop per spec. Ensure pack_card_ids are slugged.
+- Add CLI per spec: --num_pods, --human_seat, --bot_policies (7 entries), --format, --output, --seed, optional verbosity/overlay and --auto_human for testing.
+- Implement human CLI prompt (pack display, pool size, optional hero delta), input validation, 'q' to quit.
+- Logging: per-pick schema (pod_id, seat_idx, policy_name, pack_number, pick_number, format, pack_card_ids, pool_before/after, chosen_card, optional hero_value_before/after/delta); summary parquet with deck_effect; optional replay parquet.
+- Deck scoring: build deck from pool (or via deck_builder) and score with evaluate_deck/evaluate_deck_bump.
+- Validation/tests: check bot policies count, human_seat bounds; add bots-only smoke and auto-human mode; ensure reproducibility with seed.
+
+You can run end-to-end by:
+
+  1. PYTHONPATH=. python scripts/build_bc_dataset_from_raw.py --input data/raw/draft_data_public.FIN.PremierDraft.csv.gz --output data/processed/ 
+     bc_dataset_full.parquet
+  2. PYTHONPATH=. python scripts/train_hero_chunked.py (uses full bc_dataset with OOF labels)
+  3. PYTHONPATH=. python human_policy/train_human_policy.py --input data/processed/bc_tensors_full.parquet (after rebuilding tensors with
+     bc_dataset_builder.py if needed).
+
+How to run run_pod_human.py:
+- Bots-only/auto-human smoke:
+  ```
+  PYTHONPATH=. .\.venv\Scripts\python.exe scripts\run_pod_human.py ^
+    --num_pods 1 ^
+    --human_seat 0 ^
+    --bot_policies hero,hero,hero,hero,hero,hero,hero ^
+    --format FIN ^
+    --output data\processed\human_pods.parquet ^
+    --seed 42 ^
+    --auto_human
+  ```
+- Omit --auto_human for an interactive human prompt.
+- Outputs: summary parquet at --output; picks log at <output_stem>_picks.parquet.
+
+Plan: UI wrapper for run_pod_human with card art (Raw_ArtCropDatabase)
+- Goal: point-and-click pod draft UI against bots, showing card art for pack/pool/history.
+- Data: read grpId/name/ArtId from Raw_CardDatabase_*.mtga; fetch art blobs from Raw_ArtCropDatabase_*.mtga (same directory). If blobs are compressed, wrap with zlib.decompress; otherwise base64-encode directly for data URLs.
+- API wrapper: expose run_pod_human core via FastAPI/Starlette.
+  - POST /api/session {num_pods,human_seat,bot_policies,format,seed} -> session_id.
+  - GET /api/state?session_id=... -> current pack (cards: name, grpId, art_uri, optional score), pool, pack#/pick#, pod meta.
+  - POST /api/pick {session_id, card_id} -> apply human pick, run bots to next human turn.
+  - Optional WS /api/stream for push updates.
+- Frontend: static page (React/Vite or vanilla) served by StaticFiles.
+  - Pack grid with art tiles (click to pick), pool sidebar with art thumbnails sorted by color/type, picks history, pack/pick counter.
+  - Use art_uri data URLs to avoid separate file hosting.
+- Asset helper: module to load/cache grpId -> {name, color, art_uri}.
+  - Query Raw_CardDatabase: Cards join Localizations_enUS for names and ArtId (or equivalent) for art lookup.
+  - Query Raw_ArtCropDatabase: list tables, PRAGMA columns; likely ArtCrops(ArtId, Image). Cache per grpId, preload active-set IDs to avoid per-request DB hits; optionally persist to Temp/arts_<set>.json for reuse.
+- Flow: UI calls /api/state -> renders pack with art -> user clicks -> POST /api/pick -> server advances bots -> UI refreshes state.
+- Validation: support --auto_human for smoke tests; ensure grpId mapping matches pack generator; include log paths in /api/state for debugging.
+
+2025-12-02 pod UI with art:
+- Added scripts/run_pod_human_ui.py (FastAPI): POST /api/session, GET /api/state, POST /api/pick; serves static UI from scripts/pod_ui.
+- Added scripts/pod_assets.py: loads card names/grpIds/artIds from Raw_CardDatabase_*.mtga and extracts art from AssetBundle/<ArtId>_CardArt_*.mtga via UnityPy (optional; falls back to placeholders).
+- Added static UI (scripts/pod_ui/index.html, app.js, styles.css, placeholder.svg): pack grid with art, pool sidebar, simple controls for format/seed/human seat/bots.
+- Run: PYTHONPATH=. .\.venv\Scripts\uvicorn scripts.run_pod_human_ui:app --port 8002 --reload; open http://localhost:8002. Install UnityPy (added to requirements.txt) to see art; otherwise placeholders render.
+
+Strategy: upgrade hero-bot policy
+- Targets: use OOF bump labels (deck_bump_oof) to avoid leakage and improve calibration vs. deck_effect.
+- Training path (full, chunked): PYTHONPATH=. .\.venv\Scripts\python.exe scripts/train_hero_chunked.py (merges bc_dataset.parquet with reports/deck_effect_oof.parquet, trains XGB on deck_bump_oof, saves hero_bot/models/state_value.pkl).
+- Alternatives: scripts/train_hero_full.py (full in-memory merge, also deck_bump_oof) if RAM allows; for samples/hparam sweeps, adjust hero_bot/train_state_value.py (max_depth/eta/estimators/early stopping) and run on a capped input.
+- Validation: smoke with PYTHONPATH=. .\.venv\Scripts\python.exe scripts/run_tournament.py --games 1 --policy hero to ensure model loads/scores; check reports outputs (bins/svg) if rerun with chunked trainer.
+- Rollout: restart services (live_overlay, run_pod_human_ui) to pick up new state_value.pkl; keep OOF labels current if data refreshes.
+
+Hero policy flexibility:
+- Added hero_policy_soft (hero_bot/hero_policy.py) to sample picks via softmax over hero values (env HERO_TEMP for temperature, HERO_EPS for epsilon; optional top_k). Added alias to run_pod_human POLICY_MAP as hero_soft. Default greedy hero remains hero.
+
+Hero policy change (soft/stochastic option):
+- Added hero_policy_soft in hero_bot/hero_policy.py: samples picks via softmax over hero values (temperature from HERO_TEMP, epsilon from HERO_EPS, optional top_k). Falls back to evaluator if model is missing.
+- run_pod_human policy map includes hero_soft; use --bot_policies hero_soft,... to enable.
+- Tunables: HERO_TEMP (default 0.25), HERO_EPS (default 0), top_k param if desired.
+- If full soft value distillation is needed (train a separate policy to match hero’s soft targets), add a pipeline to generate soft labels from hero Q-values and train a policy head; current change is inference-time stochasticity without retrain.
+
+Hero policy distillation (per hero_policy_upgrade.md):
+- Added scripts/train_hero_policy_distill.py: builds soft targets from hero value model (state_value.pkl), converts pack hero Q to softmax (temperature), trains XGB regressor on (state + card) -> prob, saves hero_bot/models/hero_policy_distill.pkl (+ meta).
+- Added hero_policy_distill in hero_bot/hero_policy.py; uses distilled model to sample picks (softmax with HERO_DISTILL_TEMP/HERO_EPS/top_k). Wired into run_pod_human as hero_distill.
+- Current run: PYTHONPATH=. .\.venv\Scripts\python.exe scripts/train_hero_policy_distill.py --input data/processed/bc_dataset_sample_5k.parquet --max_rows 2000 --temperature 0.25; outputs hero_bot/models/hero_policy_distill.pkl (meta: temperature 0.25, max_rows 2000).
+- Notes: trained on a small 2k-row sample for speed; for better fidelity, rerun on larger bc_dataset slice (e.g., max_rows 50k-200k) after ensuring hero value model is fixed.
+
+Hero picks logging (where to see hero draft paths):
+- bc_dataset.parquet is human history only.
+- Hero picks are logged when running sims:
+  - scripts/run_pod_human.py writes <output>.parquet (summary) and <output>_picks.parquet (per-pick with pack_card_ids, pool_before/after, chosen_card, pack/pick numbers, policy_name). Example: run with --bot_policies hero,... and --auto_human to watch hero draft.
+  - scripts/run_tournament.py with --log_picks writes a picks parquet alongside the output.
+- To inspect hero’s draft decisions, load the *_picks.parquet emitted by these runs; that contains the pick path (pack/pool before/after, chosen_card).
+
+Inspecting pick replays in Python (example: reports/replay_hero.parquet):
+```
+import pandas as pd
+df = pd.read_parquet("reports/replay_hero.parquet")
+print("rows:", len(df), "cols:", df.columns.tolist())
+
+# seat 0 picks in order
+seat0 = df[df["seat"] == 0].sort_values(["pack_number","pick_number"])
+print(seat0[["pack_number","pick_number","chosen_card","pack_cards"]].head())
+
+# inspect pool/cards for a single pick
+row = seat0.iloc[0]
+print("pack:", row.pack_cards)
+print("pool before:", row.pool_counts)
+print("chosen:", row.chosen_card, "deck_effect:", row.deck_effect, "deck_bump:", row.deck_bump)
+
+# replay text
+for _, pick in seat0.iterrows():
+    print(f"P{pick.pack_number} Pick {pick.pick_number}: chose {pick.chosen_card}")
+```
+Schema: seat, pack_number, pick_number, pack_cards (list), pool_counts (dict before pick), chosen_card, deck_effect, deck_bump (after pick).

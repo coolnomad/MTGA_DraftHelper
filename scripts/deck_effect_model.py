@@ -24,7 +24,7 @@ import pickle
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -36,6 +36,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(REPO_ROOT))
 
 from src.data.loaders import load_games, load_decks  # noqa: E402
+
+# OOF output path
+OOF_PATH = REPO_ROOT / "reports" / "deck_effect_oof.parquet"
 
 
 W_STOP = 7
@@ -385,6 +388,16 @@ def write_simple_pdf(path: Path, lines: List[str]):
 def main():
     games = load_games()
     decks = load_decks()
+    _, _, metrics = train_eval_save(games, decks)
+    return metrics
+
+
+def train_eval_save(
+    games: pd.DataFrame,
+    decks: pd.DataFrame,
+    booster_path: Optional[Path] = None,
+    meta_path: Optional[Path] = None,
+):
 
     # stop-rule stats
     post_tbl = posterior_mean_by_draft(games)
@@ -532,7 +545,8 @@ def main():
     write_simple_pdf(REPORTS_DIR / "deck_effect_report.pdf", lines)
 
     # save artifacts
-    booster.save_model(MODELS_DIR / "deck_effect_xgb.json")
+    booster_path = booster_path or (MODELS_DIR / "deck_effect_xgb.json")
+    booster.save_model(booster_path)
     meta = {
         "theta0": float(theta0),
         "theta1": float(theta1),
@@ -546,10 +560,96 @@ def main():
         "alpha": ALPHA,
         "beta": BETA,
     }
-    with open(MODELS_DIR / "deck_effect_meta.pkl", "wb") as f:
+    meta_path = meta_path or (MODELS_DIR / "deck_effect_meta.pkl")
+    with open(meta_path, "wb") as f:
         pickle.dump(meta, f)
 
-    return metrics_out
+    return booster, meta, metrics_out
+
+
+def oof_predictions_two_fold():
+    """Two-fold out-of-fold deck effect/bump predictions saved to reports/deck_effect_oof.parquet."""
+    games = load_games()
+    decks = load_decks()
+    # shuffle drafts, split in half
+    draft_ids = games["draft_id"].unique().tolist()
+    rng = np.random.default_rng(SEED)
+    rng.shuffle(draft_ids)
+    mid = len(draft_ids) // 2
+    drafts_a, drafts_b = set(draft_ids[:mid]), set(draft_ids[mid:])
+
+    def fit_on(draft_subset: set, tag: str):
+        g = games[games["draft_id"].isin(draft_subset)].copy()
+        d = decks[decks["draft_id"].isin(draft_subset)].copy()
+        fold_dir = MODELS_DIR / "fold_models"
+        fold_dir.mkdir(parents=True, exist_ok=True)
+        booster_path = fold_dir / f"deck_effect_xgb_{tag}.json"
+        meta_path = fold_dir / f"deck_effect_meta_{tag}.pkl"
+        booster, meta, _ = train_eval_save(g, d, booster_path=booster_path, meta_path=meta_path)
+        return booster, meta
+
+    # recompute features on full data (same as train_eval_save)
+    post_tbl = posterior_mean_by_draft(games)
+    base_p = oof_base_p_two_buckets(games)
+    games = games.assign(base_p=base_p)
+    draft_base = (
+        games.groupby("draft_id")
+        .agg(base_p=("base_p", "mean"), gp_bucket=("user_n_games_bucket", "first"))
+        .reset_index()
+        .merge(post_tbl, on="draft_id", how="left")
+    )
+    draft_base["A"] = np.minimum(draft_base["w_stop"].to_numpy(), W_STOP)
+    draft_base["B"] = np.minimum(draft_base["l_stop"].to_numpy(), L_STOP)
+    draft_base["p_mle"] = draft_base["A"] / (draft_base["A"] + draft_base["B"])
+    cal_base = fit_basep_logit_cal_grouped(draft_base)
+    draft_base["base_p_cal"] = apply_basep_logit_cal_grouped(
+        draft_base["base_p"].to_numpy(), draft_base["gp_bucket"], cal_base
+    )
+    deck_cols = [c for c in decks.columns if c.startswith("deck_")]
+    decks_sub = decks[["draft_id"] + deck_cols].copy()
+    decks_sub["draft_id"] = decks_sub["draft_id"].astype(str)
+    D = draft_base.merge(decks_sub, on="draft_id", how="inner")
+    base_p_vec = D["base_p_cal"].to_numpy()
+    feature_cols = ["base_p_cal"] + deck_cols
+    X = D[feature_cols].to_numpy(dtype=float)
+
+    # train on A, predict B
+    booster_a, meta_a = fit_on(drafts_a, "foldA")
+    theta0_a, theta1_a = meta_a["theta0"], meta_a["theta1"]
+    mask_b = D["draft_id"].isin(drafts_b)
+    dmat_b = xgb.DMatrix(X[mask_b])
+    s_b = booster_a.predict(dmat_b)
+    base_b = base_p_vec[mask_b]
+    net_b = clip01(expit(logit(clip01(base_b)) + theta0_a + theta1_a * s_b))
+    bump_b = net_b - base_b
+
+    # train on B, predict A
+    booster_b, meta_b = fit_on(drafts_b, "foldB")
+    theta0_b, theta1_b = meta_b["theta0"], meta_b["theta1"]
+    mask_a = D["draft_id"].isin(drafts_a)
+    dmat_a = xgb.DMatrix(X[mask_a])
+    s_a = booster_b.predict(dmat_a)
+    base_a = base_p_vec[mask_a]
+    net_a = clip01(expit(logit(clip01(base_a)) + theta0_b + theta1_b * s_a))
+    bump_a = net_a - base_a
+
+    deck_effect_oof = np.zeros(len(D))
+    deck_bump_oof = np.zeros(len(D))
+    deck_effect_oof[mask_b] = net_b
+    deck_bump_oof[mask_b] = bump_b
+    deck_effect_oof[mask_a] = net_a
+    deck_bump_oof[mask_a] = bump_a
+
+    out = pd.DataFrame(
+        {
+            "draft_id": D["draft_id"],
+            "deck_effect_oof": deck_effect_oof,
+            "deck_bump_oof": deck_bump_oof,
+        }
+    )
+    OOF_PATH.parent.mkdir(parents=True, exist_ok=True)
+    out.to_parquet(OOF_PATH, index=False)
+    return {"path": str(OOF_PATH), "n": len(D)}
 
 
 if __name__ == "__main__":
