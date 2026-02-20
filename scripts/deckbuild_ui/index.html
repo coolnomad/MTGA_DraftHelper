@@ -1,0 +1,66 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Deckbuild UI</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>Deckbuilding UI</h1>
+    <div class="session">Session: <code id="sessionId">-</code></div>
+  </header>
+
+  <main class="layout">
+    <section class="panel entry">
+      <h2>Deck Entry</h2>
+      <label>Locked Deck List</label>
+      <textarea id="lockedList" rows="7" placeholder="2 Lightning Bolt&#10;Lightning Bolt"></textarea>
+      <label>Locked Deck CSV</label>
+      <input id="lockedCsvFile" type="file" accept=".csv,text/csv" />
+      <label>Wobble / Sideboard List</label>
+      <textarea id="wobbleList" rows="6" placeholder="1 Negate&#10;2 Disenchant"></textarea>
+      <label>Wobble / Sideboard CSV</label>
+      <input id="wobbleCsvFile" type="file" accept=".csv,text/csv" />
+      <label>Optional Pool List</label>
+      <textarea id="poolList" rows="4" placeholder="Extra cards that should stay in pool"></textarea>
+      <label>Optional Pool CSV</label>
+      <input id="poolCsvFile" type="file" accept=".csv,text/csv" />
+      <label>Base P User</label>
+      <input id="baseP" type="number" step="0.01" min="0" max="1" value="0.55" />
+      <div class="row">
+        <button id="newSessionBtn">New Session</button>
+        <button id="loadPoolBtn">Load Entries</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Basics</h2>
+      <div id="basicsBar" class="basics"></div>
+      <h2>Pool</h2>
+      <div id="poolCards" class="cards"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Locked Deck</h2>
+      <div class="meta">Deck count: <span id="deckCount">0</span></div>
+      <div id="lockedCards" class="cards"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Wobble</h2>
+      <div id="wobbleCards" class="cards"></div>
+      <div class="eval">
+        <button id="evalBtn">Evaluate</button>
+        <table id="evalTable">
+          <thead><tr><th>base_p</th><th>deck_bump</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
