@@ -27,6 +27,24 @@ class DummyScorer:
         return [float(sum(d.values())) * 0.001 for d in decks]
 
 
+class MockBeamScorer:
+    def __init__(self):
+        self.calls = 0
+
+    def predict_batch(self, decks, base_p):
+        self.calls += 1
+        out = []
+        for d in decks:
+            s = (
+                3.0 * d.get("Upgrade2", 0)
+                + 2.0 * d.get("Upgrade1", 0)
+                - 1.5 * d.get("Bad1", 0)
+                - 1.0 * d.get("Bad2", 0)
+            )
+            out.append(s * float(base_p))
+        return out
+
+
 def test_parse_pasted_list():
     text = "2 Lightning Bolt\nLightning Bolt\n\n1 Shock\n"
     out = parse_pasted_list(text)
@@ -93,6 +111,53 @@ def test_suggest_swaps_and_auto_iterate():
     it = svc.auto_iterate(ses.session_id, max_steps=2)
     assert "applied_swaps" in it
     assert "final" in it
+
+
+def test_beam_search_finds_multi_swap_path():
+    scorer = MockBeamScorer()
+    svc = DeckBuildService(asset_loader=DummyAssets(), scorer=scorer)
+    ses = svc.create_session(0.55)
+    ses.locked_counts = {f"Filler{i}": 1 for i in range(38)}
+    ses.locked_counts["Bad1"] = 1
+    ses.locked_counts["Bad2"] = 1
+    ses.wobble_counts = {"Upgrade1": 1, "Upgrade2": 1}
+    ses.pool_counts = {"Upgrade1": 1, "Upgrade2": 1, "Bad1": 1, "Bad2": 1}
+    out = svc.optimize_beam(
+        session_id=ses.session_id,
+        steps=3,
+        beam_width=4,
+        top_children_per_parent=20,
+        R=5,
+        rank_mode="user",
+    )
+    assert out["best"]["rank_score"] >= out["start"]["rank_score"]
+    assert len(out["path"]) >= 1
+
+
+def test_beam_respects_pool_availability():
+    scorer = MockBeamScorer()
+    svc = DeckBuildService(asset_loader=DummyAssets(), scorer=scorer)
+    ses = svc.create_session(0.55)
+    ses.locked_counts = {f"Filler{i}": 1 for i in range(39)}
+    ses.locked_counts["Bad1"] = 1
+    ses.wobble_counts = {"Upgrade1": 1}
+    ses.pool_counts = {"Bad1": 1}  # Upgrade1 unavailable in pool
+    out = svc.optimize_beam(session_id=ses.session_id, steps=2, beam_width=3, R=4)
+    assert len(out["path"]) == 0
+
+
+def test_beam_scoring_cache_reuse():
+    scorer = MockBeamScorer()
+    svc = DeckBuildService(asset_loader=DummyAssets(), scorer=scorer)
+    ses = svc.create_session(0.55)
+    ses.locked_counts = {f"Filler{i}": 1 for i in range(39)}
+    ses.locked_counts["Bad1"] = 1
+    ses.wobble_counts = {"Upgrade1": 1}
+    ses.pool_counts = {"Upgrade1": 1, "Bad1": 1}
+    _ = svc.optimize_beam(session_id=ses.session_id, steps=2, beam_width=3, R=4)
+    calls_after_first = scorer.calls
+    _ = svc.optimize_beam(session_id=ses.session_id, steps=2, beam_width=3, R=4)
+    assert scorer.calls == calls_after_first
 
 
 def test_feature_encoding_correctness():

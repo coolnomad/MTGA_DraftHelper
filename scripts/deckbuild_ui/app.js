@@ -5,6 +5,7 @@
   poolCsvText: "",
   data: null,
   suggestions: null,
+  beamResult: null,
 };
 
 const byId = (id) => document.getElementById(id);
@@ -70,6 +71,23 @@ function renderSuggestions() {
   }
 }
 
+function renderBeam() {
+  const summary = byId("beamSummary");
+  const pathRoot = byId("beamPath");
+  summary.textContent = "";
+  pathRoot.innerHTML = "";
+  if (!state.beamResult) return;
+  const start = state.beamResult.start || {};
+  const best = state.beamResult.best || {};
+  const path = state.beamResult.path || [];
+  summary.textContent = `Beam start: ${(start.rank_score ?? 0).toFixed(5)} | best: ${(best.rank_score ?? 0).toFixed(5)} | swaps: ${path.length}`;
+  for (const step of path) {
+    const li = document.createElement("li");
+    li.textContent = `- ${step.remove} + ${step.add} (delta ${Number(step.delta || 0).toFixed(5)})`;
+    pathRoot.appendChild(li);
+  }
+}
+
 function render() {
   if (!state.data) return;
   byId("sessionId").textContent = state.sessionId;
@@ -115,6 +133,7 @@ function render() {
     basicsRoot.appendChild(b);
   }
   renderSuggestions();
+  renderBeam();
 }
 
 async function move(card, from_zone, to_zone) {
@@ -137,6 +156,7 @@ async function newSession() {
   state.sessionId = res.session_id;
   state.data = res.state;
   state.suggestions = null;
+  state.beamResult = null;
   render();
 }
 
@@ -160,6 +180,7 @@ async function loadPool() {
     base_p_user: baseP,
   });
   state.suggestions = null;
+  state.beamResult = null;
   render();
 }
 
@@ -205,6 +226,48 @@ async function autoIterate() {
   });
   state.data = out.state;
   state.suggestions = null;
+  state.beamResult = null;
+  render();
+}
+
+async function optimizeBeam() {
+  if (!state.sessionId) return;
+  const basePUser = parseFloat(byId("baseP").value || "0.55");
+  const rankMode = byId("rankMode").value || "user";
+  state.beamResult = await api("/api/optimize_beam", "POST", {
+    session_id: state.sessionId,
+    steps: 8,
+    beam_width: 10,
+    top_children_per_parent: 60,
+    R: 12,
+    rank_mode: rankMode,
+    mode_removable: "auto",
+    include_basic_adds: false,
+    include_basic_tweaks: false,
+    base_p_values: [0.4, 0.5, 0.6, basePUser],
+  });
+  renderBeam();
+}
+
+async function applyBeamPath() {
+  if (!state.sessionId || !state.beamResult || !state.beamResult.path) return;
+  const path = state.beamResult.path;
+  for (const step of path) {
+    await api("/api/move", "POST", {
+      session_id: state.sessionId,
+      card_id: step.remove,
+      from_zone: "locked",
+      to_zone: "wobble",
+    });
+    await api("/api/move", "POST", {
+      session_id: state.sessionId,
+      card_id: step.add,
+      from_zone: "wobble",
+      to_zone: "locked",
+    });
+  }
+  state.data = await api(`/api/state?session_id=${encodeURIComponent(state.sessionId)}`);
+  state.suggestions = null;
   render();
 }
 
@@ -240,5 +303,7 @@ byId("loadPoolBtn").onclick = () => loadPool().catch((e) => alert(e.message));
 byId("evalBtn").onclick = () => evaluateDeck().catch((e) => alert(e.message));
 byId("suggestBtn").onclick = () => suggestImprovements().catch((e) => alert(e.message));
 byId("iterateBtn").onclick = () => autoIterate().catch((e) => alert(e.message));
+byId("beamBtn").onclick = () => optimizeBeam().catch((e) => alert(e.message));
+byId("applyPathBtn").onclick = () => applyBeamPath().catch((e) => alert(e.message));
 
 newSession().catch((e) => console.error(e));

@@ -6,6 +6,7 @@ import json
 import re
 import sys
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -76,6 +77,22 @@ class AutoIterateRequest(BaseModel):
     removable_cards: Optional[List[str]] = None
     max_removables: int = 30
     include_basic_adds: bool = False
+
+
+class OptimizeBeamRequest(BaseModel):
+    session_id: str
+    steps: int = 8
+    beam_width: int = 10
+    top_children_per_parent: int = 60
+    R: int = 12
+    rank_mode: str = "user"
+    mode_removable: str = "auto"  # auto|manual
+    removable_cards: Optional[List[str]] = None
+    include_basic_adds: bool = False
+    include_basic_tweaks: bool = False
+    base_p_values: Optional[List[float]] = None
+    dedupe: bool = True
+    stop_if_no_improvement: bool = True
 
 
 @dataclass
@@ -250,6 +267,8 @@ class DeckBuildService:
         self.asset_loader = asset_loader
         self.scorer = scorer
         self.sessions: Dict[str, DeckBuildSession] = {}
+        self._score_cache: OrderedDict[tuple, dict] = OrderedDict()
+        self._score_cache_max = 50000
 
     def create_session(self, base_p_user: float) -> DeckBuildSession:
         sid = str(uuid.uuid4())
@@ -413,15 +432,82 @@ class DeckBuildService:
         best = min(predictions, key=lambda p: abs(float(p["base_p"]) - float(base_p_user)))
         return float(best["deck_bump"])
 
-    def _predict_decks(self, decks: List[Dict[str, int]], base_p_values: List[float]) -> List[List[Dict[str, float]]]:
+    def _deck_key(self, deck_counts: Dict[str, int]) -> tuple:
+        return tuple(sorted((k, int(v)) for k, v in deck_counts.items() if int(v) > 0))
+
+    def _cache_get(self, key: tuple) -> Optional[dict]:
+        val = self._score_cache.get(key)
+        if val is None:
+            return None
+        self._score_cache.move_to_end(key)
+        return val
+
+    def _cache_put(self, key: tuple, value: dict) -> None:
+        self._score_cache[key] = value
+        self._score_cache.move_to_end(key)
+        while len(self._score_cache) > self._score_cache_max:
+            self._score_cache.popitem(last=False)
+
+    def _score_decks(
+        self,
+        decks: List[Dict[str, int]],
+        base_p_values: List[float],
+        rank_mode: str,
+        base_p_user: float,
+    ) -> List[dict]:
         if not decks:
             return []
-        per_deck = [[{"base_p": float(bp), "deck_bump": 0.0} for bp in base_p_values] for _ in decks]
-        for j, bp in enumerate(base_p_values):
-            preds = self.scorer.predict_batch(decks, float(bp))
-            for i, p in enumerate(preds):
-                per_deck[i][j]["deck_bump"] = float(p)
-        return per_deck
+        base_ps = tuple(float(x) for x in base_p_values)
+        mode = (rank_mode or "user").lower()
+        out: List[Optional[dict]] = [None] * len(decks)
+        miss_idx: List[int] = []
+        miss_decks: List[Dict[str, int]] = []
+        miss_keys: List[tuple] = []
+
+        for i, d in enumerate(decks):
+            d_key = self._deck_key(d)
+            c_key = (d_key, base_ps, mode, float(base_p_user))
+            cached = self._cache_get(c_key)
+            if cached is not None:
+                out[i] = cached
+            else:
+                miss_idx.append(i)
+                miss_decks.append(d)
+                miss_keys.append(c_key)
+
+        if miss_decks:
+            n = len(miss_decks)
+            t = len(base_ps)
+            if hasattr(self.scorer, "booster") and hasattr(self.scorer, "vectorize_deck"):
+                vecs = []
+                base_idx = self.scorer.col_to_idx["base_p"]
+                for d in miss_decks:
+                    v = self.scorer.vectorize_deck(d, 0.5)
+                    vecs.append(v)
+                X_base = np.vstack(vecs)
+                X = np.repeat(X_base, t, axis=0)
+                for j, bp in enumerate(base_ps):
+                    X[j::t, base_idx] = float(bp)
+                y = self.scorer.booster.predict(xgb.DMatrix(X, feature_names=self.scorer.feature_cols))
+                y2 = y.reshape((n, t))
+            else:
+                y2 = np.zeros((n, t), dtype=float)
+                for j, bp in enumerate(base_ps):
+                    preds = self.scorer.predict_batch(miss_decks, float(bp))
+                    for i, pv in enumerate(preds):
+                        y2[i, j] = float(pv)
+            for row in range(n):
+                preds = [{"base_p": float(base_ps[j]), "deck_bump": float(y2[row, j])} for j in range(t)]
+                rank = self._rank_score(preds, mode, base_p_user)
+                val = {"predictions": preds, "rank_score": float(rank)}
+                self._cache_put(miss_keys[row], val)
+                out[miss_idx[row]] = val
+
+        return [x for x in out if x is not None]
+
+    def _predict_decks(self, decks: List[Dict[str, int]], base_p_values: List[float], rank_mode: str, base_p_user: float) -> List[List[Dict[str, float]]]:
+        scored = self._score_decks(decks, base_p_values, rank_mode, base_p_user)
+        return [s["predictions"] for s in scored]
 
     def suggest_swaps(
         self,
@@ -458,7 +544,7 @@ class DeckBuildService:
                     nd["Plains"] = nd.get("Plains", 0) + (40 - sum(nd.values()))
                 rem_decks.append(nd)
                 rem_cards.append(r)
-            rem_preds = self._predict_decks(rem_decks, base_vals)
+            rem_preds = self._predict_decks(rem_decks, base_vals, rank_mode, ses.base_p_user)
             for card, preds in zip(rem_cards, rem_preds):
                 rank = self._rank_score(preds, rank_mode, ses.base_p_user)
                 delta = rank - current_rank
@@ -491,7 +577,7 @@ class DeckBuildService:
 
         suggestions: List[Dict[str, Any]] = []
         if candidate_decks:
-            cand_preds = self._predict_decks(candidate_decks, base_vals)
+            cand_preds = self._predict_decks(candidate_decks, base_vals, rank_mode, ses.base_p_user)
             for meta, preds in zip(candidate_meta, cand_preds):
                 rank = self._rank_score(preds, rank_mode, ses.base_p_user)
                 delta = rank - current_rank
@@ -585,6 +671,166 @@ class DeckBuildService:
                 "warnings": final_eval.get("warnings", []),
             },
             "state": self.state(session_id),
+        }
+
+    def _pool_limit(self, ses: DeckBuildSession, card: str) -> int:
+        return int(
+            max(
+                ses.pool_counts.get(card, 0),
+                ses.locked_counts.get(card, 0) + ses.wobble_counts.get(card, 0),
+            )
+        )
+
+    def optimize_beam(
+        self,
+        session_id: str,
+        steps: int = 8,
+        beam_width: int = 10,
+        top_children_per_parent: int = 300,
+        R: int = 12,
+        rank_mode: str = "user",
+        mode_removable: str = "auto",
+        removable_cards: Optional[List[str]] = None,
+        include_basic_adds: bool = False,
+        include_basic_tweaks: bool = False,
+        base_p_values: Optional[List[float]] = None,
+        dedupe: bool = True,
+        stop_if_no_improvement: bool = True,
+    ) -> Dict[str, Any]:
+        ses = self.get_session(session_id)
+        base_vals = [float(v) for v in (base_p_values or [0.4, 0.5, 0.6, ses.base_p_user])]
+        start_deck, warnings = self._deck_for_eval(ses.locked_counts)
+        start_score = self._score_decks([start_deck], base_vals, rank_mode, ses.base_p_user)[0]
+        start_node = {"deck_counts": start_deck, "score": start_score, "path": []}
+        beam = [start_node]
+        best = start_node
+        trajectory = [{"step": 0, "rank_score": float(start_score["rank_score"])}]
+
+        addable = [c for c, n in ses.wobble_counts.items() if n > 0 and c not in BASIC_LANDS]
+        if include_basic_adds:
+            addable.extend(sorted(BASIC_LANDS))
+        addable = sorted(set(addable))
+
+        mode_rem = (mode_removable or "auto").lower()
+        manual_rem = set(removable_cards or [])
+
+        for step_i in range(1, max(1, int(steps)) + 1):
+            all_children: List[Dict[str, Any]] = []
+            for parent in beam:
+                p_deck = parent["deck_counts"]
+                p_score = float(parent["score"]["rank_score"])
+
+                if mode_rem == "manual" and manual_rem:
+                    rem_cards = [c for c in sorted(manual_rem) if p_deck.get(c, 0) > 0]
+                    rem_nom = [{"card": c, "delta_remove": 0.0} for c in rem_cards]
+                else:
+                    cand = sorted([c for c, n in p_deck.items() if n > 0], key=lambda x: (-p_deck[x], x))[:40]
+                    rem_decks: List[Dict[str, int]] = []
+                    for c in cand:
+                        nd = dict(p_deck)
+                        nd[c] -= 1
+                        if nd[c] <= 0:
+                            nd.pop(c, None)
+                        if sum(nd.values()) < 40:
+                            nd["Plains"] = nd.get("Plains", 0) + (40 - sum(nd.values()))
+                        rem_decks.append(nd)
+                    rem_scores = self._score_decks(rem_decks, base_vals, rank_mode, ses.base_p_user)
+                    rem_nom = []
+                    for c, s in zip(cand, rem_scores):
+                        rem_nom.append({"card": c, "delta_remove": float(s["rank_score"] - p_score)})
+                    rem_nom.sort(key=lambda x: x["delta_remove"], reverse=True)
+                    rem_cards = [x["card"] for x in rem_nom[: max(1, int(R))]]
+
+                cand_decks: List[Dict[str, int]] = []
+                cand_moves: List[Dict[str, str]] = []
+                for r in rem_cards:
+                    if p_deck.get(r, 0) <= 0:
+                        continue
+                    for a in addable:
+                        if a == r:
+                            continue
+                        nd = dict(p_deck)
+                        nd[r] -= 1
+                        if nd[r] <= 0:
+                            nd.pop(r, None)
+                        nd[a] = nd.get(a, 0) + 1
+                        if a not in BASIC_LANDS and nd.get(a, 0) > self._pool_limit(ses, a):
+                            continue
+                        cand_decks.append(nd)
+                        cand_moves.append({"remove": r, "add": a})
+
+                if include_basic_tweaks:
+                    basics_present = [b for b in sorted(BASIC_LANDS) if p_deck.get(b, 0) > 0]
+                    for bx in basics_present:
+                        for by in sorted(BASIC_LANDS):
+                            if bx == by:
+                                continue
+                            nd = dict(p_deck)
+                            nd[bx] -= 1
+                            if nd[bx] <= 0:
+                                nd.pop(bx, None)
+                            nd[by] = nd.get(by, 0) + 1
+                            cand_decks.append(nd)
+                            cand_moves.append({"remove": bx, "add": by})
+
+                if not cand_decks:
+                    continue
+                c_scores = self._score_decks(cand_decks, base_vals, rank_mode, ses.base_p_user)
+                rows = list(zip(cand_decks, cand_moves, c_scores))
+                rows.sort(key=lambda x: float(x[2]["rank_score"]), reverse=True)
+                rows = rows[: max(1, int(top_children_per_parent))]
+                for d, m, s in rows:
+                    all_children.append(
+                        {
+                            "deck_counts": d,
+                            "score": s,
+                            "path": parent["path"]
+                            + [
+                                {
+                                    "remove": m["remove"],
+                                    "add": m["add"],
+                                    "delta": float(s["rank_score"] - p_score),
+                                }
+                            ],
+                        }
+                    )
+
+            if not all_children:
+                break
+
+            if dedupe:
+                best_by_key: Dict[tuple, Dict[str, Any]] = {}
+                for ch in all_children:
+                    k = self._deck_key(ch["deck_counts"])
+                    prev = best_by_key.get(k)
+                    if prev is None or float(ch["score"]["rank_score"]) > float(prev["score"]["rank_score"]):
+                        best_by_key[k] = ch
+                all_children = list(best_by_key.values())
+
+            all_children.sort(key=lambda x: float(x["score"]["rank_score"]), reverse=True)
+            beam = all_children[: max(1, int(beam_width))]
+            step_best = beam[0]
+            improved = float(step_best["score"]["rank_score"]) > float(best["score"]["rank_score"])
+            if improved:
+                best = step_best
+            trajectory.append({"step": step_i, "rank_score": float(best["score"]["rank_score"])})
+            if stop_if_no_improvement and not improved:
+                #break
+                continue
+
+        return {
+            "start": {
+                "rank_score": float(start_score["rank_score"]),
+                "predictions": start_score["predictions"],
+            },
+            "best": {
+                "rank_score": float(best["score"]["rank_score"]),
+                "predictions": best["score"]["predictions"],
+                "deck_counts": best["deck_counts"],
+            },
+            "path": best["path"],
+            "trajectory": trajectory,
+            "warnings": warnings,
         }
 
     def _serialize_card(self, name: str, count: int) -> Dict:
@@ -705,6 +951,25 @@ def auto_iterate(req: AutoIterateRequest):
         removable_cards=req.removable_cards,
         max_removables=req.max_removables,
         include_basic_adds=req.include_basic_adds,
+    )
+
+
+@app.post("/api/optimize_beam")
+def optimize_beam(req: OptimizeBeamRequest):
+    return service.optimize_beam(
+        session_id=req.session_id,
+        steps=req.steps,
+        beam_width=req.beam_width,
+        top_children_per_parent=req.top_children_per_parent,
+        R=req.R,
+        rank_mode=req.rank_mode,
+        mode_removable=req.mode_removable,
+        removable_cards=req.removable_cards,
+        include_basic_adds=req.include_basic_adds,
+        include_basic_tweaks=req.include_basic_tweaks,
+        base_p_values=req.base_p_values,
+        dedupe=req.dedupe,
+        stop_if_no_improvement=req.stop_if_no_improvement,
     )
 
 
