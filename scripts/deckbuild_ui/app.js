@@ -4,6 +4,7 @@
   wobbleCsvText: "",
   poolCsvText: "",
   data: null,
+  suggestions: null,
 };
 
 const byId = (id) => document.getElementById(id);
@@ -52,6 +53,23 @@ function cardRow(card, actions) {
   return row;
 }
 
+function renderSuggestions() {
+  const summary = byId("optSummary");
+  const tbody = byId("suggestTable").querySelector("tbody");
+  summary.textContent = "";
+  tbody.innerHTML = "";
+  if (!state.suggestions) return;
+  const cur = state.suggestions.current || {};
+  const sug = state.suggestions.suggestions || [];
+  const warns = (cur.warnings || []).join(" | ");
+  summary.textContent = `Current rank_score: ${(cur.rank_score ?? 0).toFixed(5)} | Suggestions: ${sug.length}${warns ? " | " + warns : ""}`;
+  for (const s of sug) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${s.remove}</td><td>${s.add}</td><td>${s.delta.toFixed(5)}</td><td>${s.new_rank_score.toFixed(5)}</td>`;
+    tbody.appendChild(tr);
+  }
+}
+
 function render() {
   if (!state.data) return;
   byId("sessionId").textContent = state.sessionId;
@@ -96,6 +114,7 @@ function render() {
     b.onclick = () => move(name, "pool", "locked");
     basicsRoot.appendChild(b);
   }
+  renderSuggestions();
 }
 
 async function move(card, from_zone, to_zone) {
@@ -117,6 +136,7 @@ async function newSession() {
   const res = await api("/api/session", "POST", { base_p_user: baseP });
   state.sessionId = res.session_id;
   state.data = res.state;
+  state.suggestions = null;
   render();
 }
 
@@ -139,6 +159,7 @@ async function loadPool() {
     session_id: state.sessionId,
     base_p_user: baseP,
   });
+  state.suggestions = null;
   render();
 }
 
@@ -156,6 +177,35 @@ async function evaluateDeck() {
     tr.innerHTML = `<td>${p.base_p.toFixed(2)}</td><td>${p.deck_bump.toFixed(5)}</td>`;
     tbody.appendChild(tr);
   }
+}
+
+async function suggestImprovements() {
+  if (!state.sessionId) return;
+  const basePUser = parseFloat(byId("baseP").value || "0.55");
+  const rankMode = byId("rankMode").value || "user";
+  const topK = parseInt(byId("topK").value || "15", 10);
+  state.suggestions = await api("/api/suggest_swaps", "POST", {
+    session_id: state.sessionId,
+    top_k: topK,
+    rank_mode: rankMode,
+    base_p_values: [0.4, 0.5, 0.6, basePUser],
+  });
+  renderSuggestions();
+}
+
+async function autoIterate() {
+  if (!state.sessionId) return;
+  const basePUser = parseFloat(byId("baseP").value || "0.55");
+  const rankMode = byId("rankMode").value || "user";
+  const out = await api("/api/auto_iterate", "POST", {
+    session_id: state.sessionId,
+    max_steps: 10,
+    rank_mode: rankMode,
+    base_p_values: [0.4, 0.5, 0.6, basePUser],
+  });
+  state.data = out.state;
+  state.suggestions = null;
+  render();
 }
 
 byId("lockedCsvFile").addEventListener("change", async (ev) => {
@@ -188,5 +238,7 @@ byId("poolCsvFile").addEventListener("change", async (ev) => {
 byId("newSessionBtn").onclick = () => newSession().catch((e) => alert(e.message));
 byId("loadPoolBtn").onclick = () => loadPool().catch((e) => alert(e.message));
 byId("evalBtn").onclick = () => evaluateDeck().catch((e) => alert(e.message));
+byId("suggestBtn").onclick = () => suggestImprovements().catch((e) => alert(e.message));
+byId("iterateBtn").onclick = () => autoIterate().catch((e) => alert(e.message));
 
 newSession().catch((e) => console.error(e));

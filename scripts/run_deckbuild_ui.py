@@ -8,7 +8,7 @@ import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import xgboost as xgb
@@ -56,6 +56,26 @@ class BasePRequest(BaseModel):
 class EvaluateRequest(BaseModel):
     session_id: str
     base_p_values: Optional[List[float]] = None
+
+
+class SuggestSwapsRequest(BaseModel):
+    session_id: str
+    top_k: int = 20
+    rank_mode: str = "user"  # user|mean|min
+    base_p_values: Optional[List[float]] = None
+    removable_cards: Optional[List[str]] = None
+    max_removables: int = 30
+    include_basic_adds: bool = False
+
+
+class AutoIterateRequest(BaseModel):
+    session_id: str
+    max_steps: int = 10
+    rank_mode: str = "user"  # user|mean|min
+    base_p_values: Optional[List[float]] = None
+    removable_cards: Optional[List[str]] = None
+    max_removables: int = 30
+    include_basic_adds: bool = False
 
 
 @dataclass
@@ -143,6 +163,12 @@ class DeckBumpScorer:
         for bp, p in zip(base_p_values, preds):
             out.append({"base_p": float(bp), "deck_bump": float(p)})
         return out
+
+    def predict_batch(self, decks: List[Dict[str, int]], base_p: float) -> np.ndarray:
+        if not decks:
+            return np.array([], dtype=float)
+        X = np.vstack([self.vectorize_deck(deck, base_p) for deck in decks])
+        return self.booster.predict(xgb.DMatrix(X, feature_names=self.feature_cols))
 
 
 def clamp_count(v: int) -> int:
@@ -332,10 +358,233 @@ class DeckBuildService:
         ses = self.get_session(session_id)
         values = base_p_values or [0.4, 0.5, 0.6, ses.base_p_user]
         vals = [float(v) for v in values]
-        preds = self.scorer.predict_many(ses.locked_counts, vals)
+        deck_eval, warnings = self._deck_for_eval(ses.locked_counts)
+        preds = self.scorer.predict_many(deck_eval, vals)
         return {
             "deck_count": int(sum(ses.locked_counts.values())),
+            "deck_count_eval": int(sum(deck_eval.values())),
             "predictions": preds,
+            "warnings": warnings,
+        }
+
+    def _deck_for_eval(self, locked_counts: Dict[str, int]) -> tuple[Dict[str, int], List[str]]:
+        deck = {k: int(v) for k, v in locked_counts.items() if int(v) > 0}
+        warnings: List[str] = []
+        total = sum(deck.values())
+        if total < 40:
+            deck["Plains"] = deck.get("Plains", 0) + (40 - total)
+            warnings.append(f"Deck had {total} cards; auto-filled to 40 with Plains.")
+        elif total > 40:
+            over = total - 40
+            for b in sorted(BASIC_LANDS):
+                if over <= 0:
+                    break
+                take = min(deck.get(b, 0), over)
+                if take > 0:
+                    deck[b] -= take
+                    if deck[b] <= 0:
+                        deck.pop(b, None)
+                    over -= take
+            if over > 0:
+                for name in sorted([n for n in deck.keys() if n not in BASIC_LANDS]):
+                    if over <= 0:
+                        break
+                    take = min(deck.get(name, 0), over)
+                    if take > 0:
+                        deck[name] -= take
+                        if deck[name] <= 0:
+                            deck.pop(name, None)
+                        over -= take
+            warnings.append(f"Deck had {total} cards; trimmed to 40 for evaluation.")
+        basic_lands = sum(deck.get(b, 0) for b in BASIC_LANDS)
+        if basic_lands < 16 or basic_lands > 18:
+            warnings.append(f"Basic land count is {basic_lands}; target is 16-18.")
+        return deck, warnings
+
+    def _rank_score(self, predictions: List[Dict[str, float]], rank_mode: str, base_p_user: float) -> float:
+        mode = (rank_mode or "user").lower()
+        if not predictions:
+            return 0.0
+        values = [float(p["deck_bump"]) for p in predictions]
+        if mode == "mean":
+            return float(np.mean(values))
+        if mode == "min":
+            return float(np.min(values))
+        best = min(predictions, key=lambda p: abs(float(p["base_p"]) - float(base_p_user)))
+        return float(best["deck_bump"])
+
+    def _predict_decks(self, decks: List[Dict[str, int]], base_p_values: List[float]) -> List[List[Dict[str, float]]]:
+        if not decks:
+            return []
+        per_deck = [[{"base_p": float(bp), "deck_bump": 0.0} for bp in base_p_values] for _ in decks]
+        for j, bp in enumerate(base_p_values):
+            preds = self.scorer.predict_batch(decks, float(bp))
+            for i, p in enumerate(preds):
+                per_deck[i][j]["deck_bump"] = float(p)
+        return per_deck
+
+    def suggest_swaps(
+        self,
+        session_id: str,
+        top_k: int = 20,
+        rank_mode: str = "user",
+        base_p_values: Optional[List[float]] = None,
+        removable_cards: Optional[List[str]] = None,
+        max_removables: int = 30,
+        include_basic_adds: bool = False,
+    ) -> Dict[str, Any]:
+        ses = self.get_session(session_id)
+        base_vals = [float(v) for v in (base_p_values or [0.4, 0.5, 0.6, ses.base_p_user])]
+        current_deck, warnings = self._deck_for_eval(ses.locked_counts)
+        current_preds = self.scorer.predict_many(current_deck, base_vals)
+        current_rank = self._rank_score(current_preds, rank_mode, ses.base_p_user)
+
+        if removable_cards:
+            removable_raw = [c for c in removable_cards if current_deck.get(c, 0) > 0]
+        else:
+            removable_raw = [c for c, n in current_deck.items() if n > 0 and c not in BASIC_LANDS]
+
+        removable_nom: List[Dict[str, float]] = []
+        removable_pool: List[str] = []
+        if removable_raw:
+            rem_decks: List[Dict[str, int]] = []
+            rem_cards: List[str] = []
+            for r in removable_raw:
+                nd = dict(current_deck)
+                nd[r] -= 1
+                if nd[r] <= 0:
+                    nd.pop(r, None)
+                if sum(nd.values()) < 40:
+                    nd["Plains"] = nd.get("Plains", 0) + (40 - sum(nd.values()))
+                rem_decks.append(nd)
+                rem_cards.append(r)
+            rem_preds = self._predict_decks(rem_decks, base_vals)
+            for card, preds in zip(rem_cards, rem_preds):
+                rank = self._rank_score(preds, rank_mode, ses.base_p_user)
+                delta = rank - current_rank
+                removable_nom.append({"card": card, "delta_remove": float(delta)})
+            removable_nom.sort(key=lambda x: x["delta_remove"], reverse=True)
+            if removable_cards:
+                removable_pool = [r["card"] for r in removable_nom][: max(1, int(max_removables))]
+            else:
+                removable_pool = [r["card"] for r in removable_nom if r["delta_remove"] > 0][: max(1, int(max_removables))]
+
+        addable = [c for c, n in ses.wobble_counts.items() if n > 0 and c not in BASIC_LANDS]
+        if include_basic_adds:
+            addable.extend(sorted(BASIC_LANDS))
+
+        candidate_decks: List[Dict[str, int]] = []
+        candidate_meta: List[Dict[str, str]] = []
+        for r in removable_pool:
+            for a in addable:
+                if a == r:
+                    continue
+                nd = dict(current_deck)
+                if nd.get(r, 0) <= 0:
+                    continue
+                nd[r] -= 1
+                if nd[r] <= 0:
+                    nd.pop(r, None)
+                nd[a] = nd.get(a, 0) + 1
+                candidate_decks.append(nd)
+                candidate_meta.append({"remove": r, "add": a})
+
+        suggestions: List[Dict[str, Any]] = []
+        if candidate_decks:
+            cand_preds = self._predict_decks(candidate_decks, base_vals)
+            for meta, preds in zip(candidate_meta, cand_preds):
+                rank = self._rank_score(preds, rank_mode, ses.base_p_user)
+                delta = rank - current_rank
+                if delta <= 0:
+                    continue
+                suggestions.append(
+                    {
+                        "remove": meta["remove"],
+                        "add": meta["add"],
+                        "delta": float(delta),
+                        "new_rank_score": float(rank),
+                        "new_predictions": preds,
+                    }
+                )
+            suggestions.sort(key=lambda x: x["delta"], reverse=True)
+            suggestions = suggestions[: max(1, int(top_k))]
+
+        return {
+            "current": {
+                "deck_count": int(sum(ses.locked_counts.values())),
+                "deck_count_eval": int(sum(current_deck.values())),
+                "predictions": current_preds,
+                "rank_score": float(current_rank),
+                "warnings": warnings,
+            },
+            "removable_nominated": removable_nom[: max(1, int(max_removables))],
+            "suggestions": suggestions,
+        }
+
+    def auto_iterate(
+        self,
+        session_id: str,
+        max_steps: int = 10,
+        rank_mode: str = "user",
+        base_p_values: Optional[List[float]] = None,
+        removable_cards: Optional[List[str]] = None,
+        max_removables: int = 30,
+        include_basic_adds: bool = False,
+    ) -> Dict[str, Any]:
+        ses = self.get_session(session_id)
+        applied: List[Dict[str, Any]] = []
+        for step in range(max(0, int(max_steps))):
+            out = self.suggest_swaps(
+                session_id=session_id,
+                top_k=1,
+                rank_mode=rank_mode,
+                base_p_values=base_p_values,
+                removable_cards=removable_cards,
+                max_removables=max_removables,
+                include_basic_adds=include_basic_adds,
+            )
+            if not out["suggestions"]:
+                break
+            best = out["suggestions"][0]
+            remove_card = best["remove"]
+            add_card = best["add"]
+            # Apply swap into session zones.
+            if ses.locked_counts.get(remove_card, 0) <= 0:
+                break
+            ses.locked_counts[remove_card] -= 1
+            if ses.locked_counts[remove_card] <= 0:
+                ses.locked_counts.pop(remove_card, None)
+            ses.locked_counts[add_card] = ses.locked_counts.get(add_card, 0) + 1
+            if add_card in BASIC_LANDS:
+                pass
+            else:
+                ses.wobble_counts[add_card] = max(0, ses.wobble_counts.get(add_card, 0) - 1)
+                if ses.wobble_counts.get(add_card, 0) <= 0:
+                    ses.wobble_counts.pop(add_card, None)
+            ses.wobble_counts[remove_card] = ses.wobble_counts.get(remove_card, 0) + 1
+            applied.append(
+                {
+                    "step": step + 1,
+                    "remove": remove_card,
+                    "add": add_card,
+                    "delta": float(best["delta"]),
+                    "new_rank_score": float(best["new_rank_score"]),
+                }
+            )
+
+        final_eval = self.evaluate(session_id, base_p_values)
+        final_deck, _warnings = self._deck_for_eval(ses.locked_counts)
+        final_rank = self._rank_score(final_eval["predictions"], rank_mode, ses.base_p_user)
+        return {
+            "applied_swaps": applied,
+            "final": {
+                "deck_count": int(sum(ses.locked_counts.values())),
+                "deck_count_eval": int(sum(final_deck.values())),
+                "predictions": final_eval["predictions"],
+                "rank_score": float(final_rank),
+                "warnings": final_eval.get("warnings", []),
+            },
+            "state": self.state(session_id),
         }
 
     def _serialize_card(self, name: str, count: int) -> Dict:
@@ -431,6 +680,32 @@ def set_base_p(req: BasePRequest):
 @app.post("/api/evaluate")
 def evaluate(req: EvaluateRequest):
     return service.evaluate(req.session_id, req.base_p_values)
+
+
+@app.post("/api/suggest_swaps")
+def suggest_swaps(req: SuggestSwapsRequest):
+    return service.suggest_swaps(
+        session_id=req.session_id,
+        top_k=req.top_k,
+        rank_mode=req.rank_mode,
+        base_p_values=req.base_p_values,
+        removable_cards=req.removable_cards,
+        max_removables=req.max_removables,
+        include_basic_adds=req.include_basic_adds,
+    )
+
+
+@app.post("/api/auto_iterate")
+def auto_iterate(req: AutoIterateRequest):
+    return service.auto_iterate(
+        session_id=req.session_id,
+        max_steps=req.max_steps,
+        rank_mode=req.rank_mode,
+        base_p_values=req.base_p_values,
+        removable_cards=req.removable_cards,
+        max_removables=req.max_removables,
+        include_basic_adds=req.include_basic_adds,
+    )
 
 
 if __name__ == "__main__":

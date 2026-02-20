@@ -46,6 +46,8 @@ body {
 }
 
 .row { display: flex; gap: 8px; }
+.row input[type="number"],
+.row select { max-width: 90px; }
 
 .cards {
   display: grid;

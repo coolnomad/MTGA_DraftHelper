@@ -57,6 +57,25 @@
           <thead><tr><th>base_p</th><th>deck_bump</th></tr></thead>
           <tbody></tbody>
         </table>
+        <div class="row">
+          <label for="rankMode">Rank</label>
+          <select id="rankMode">
+            <option value="user">user</option>
+            <option value="mean">mean</option>
+            <option value="min">min</option>
+          </select>
+          <label for="topK">Top K</label>
+          <input id="topK" type="number" min="1" max="100" value="15" />
+        </div>
+        <div class="row">
+          <button id="suggestBtn">Suggest Improvements</button>
+          <button id="iterateBtn">Auto Iterate</button>
+        </div>
+        <div id="optSummary" class="meta"></div>
+        <table id="suggestTable">
+          <thead><tr><th>remove</th><th>add</th><th>delta</th><th>new score</th></tr></thead>
+          <tbody></tbody>
+        </table>
       </div>
     </section>
   </main>

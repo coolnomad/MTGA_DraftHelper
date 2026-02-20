@@ -23,6 +23,9 @@ class DummyScorer:
     def predict_many(self, locked_counts, base_p_values):
         return [{"base_p": float(v), "deck_bump": float(sum(locked_counts.values())) * 0.001} for v in base_p_values]
 
+    def predict_batch(self, decks, base_p):
+        return [float(sum(d.values())) * 0.001 for d in decks]
+
 
 def test_parse_pasted_list():
     text = "2 Lightning Bolt\nLightning Bolt\n\n1 Shock\n"
@@ -77,6 +80,19 @@ def test_load_pool_with_explicit_locked_and_wobble():
     assert ses.pool_counts.get("Card In Pool", 0) == 1
     assert ses.locked_counts.get("Lightning Bolt", 0) == 2
     assert ses.wobble_counts.get("Negate", 0) == 1
+
+
+def test_suggest_swaps_and_auto_iterate():
+    svc = DeckBuildService(asset_loader=DummyAssets(), scorer=DummyScorer())
+    ses = svc.create_session(0.55)
+    ses.locked_counts = {f"Card{i}": 1 for i in range(35)}
+    ses.wobble_counts = {"Negate": 1, "Disdainful Stroke": 1}
+    out = svc.suggest_swaps(ses.session_id, top_k=5, rank_mode="user")
+    assert "current" in out
+    assert "suggestions" in out
+    it = svc.auto_iterate(ses.session_id, max_steps=2)
+    assert "applied_swaps" in it
+    assert "final" in it
 
 
 def test_feature_encoding_correctness():
