@@ -1,0 +1,61 @@
+name: Deploy Deckbuild Backend (Render)
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "scripts/run_deckbuild_ui.py"
+      - "scripts/pod_assets.py"
+      - "requirements.txt"
+      - "model/**"
+      - "models/**"
+      - ".github/workflows/deploy-deckbuild-backend-render.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "deckbuild-backend-render"
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate required secret
+        shell: bash
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "$RENDER_DEPLOY_HOOK_URL" ]; then
+            echo "Missing required secret: RENDER_DEPLOY_HOOK_URL"
+            echo "Create a Render Deploy Hook URL and add it in GitHub repository secrets."
+            exit 1
+          fi
+
+      - name: Trigger Render deploy
+        shell: bash
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          curl -fsS -X POST "$RENDER_DEPLOY_HOOK_URL"
+          echo "Render deploy triggered."
+
+      - name: Wait for healthcheck (optional)
+        if: ${{ secrets.RENDER_HEALTHCHECK_URL != '' }}
+        shell: bash
+        env:
+          RENDER_HEALTHCHECK_URL: ${{ secrets.RENDER_HEALTHCHECK_URL }}
+        run: |
+          echo "Polling health endpoint: $RENDER_HEALTHCHECK_URL"
+          for i in {1..30}; do
+            if curl -fsS "$RENDER_HEALTHCHECK_URL" >/dev/null; then
+              echo "Backend is healthy."
+              exit 0
+            fi
+            echo "Not healthy yet (attempt $i/30). Retrying in 10s..."
+            sleep 10
+          done
+          echo "Timed out waiting for backend healthcheck."
+          exit 1

@@ -13,6 +13,9 @@
 GitHub Pages can host only the static frontend.  
 You still need a hosted backend API for endpoints like `/api/session`, `/api/load_pool`, `/api/optimize_beam`, etc.
 
+For automated backend deploys, see:
+- `docs/deckbuild_backend_render_deploy.md`
+
 ## Configure the backend URL in the UI
 
 In the top bar:
