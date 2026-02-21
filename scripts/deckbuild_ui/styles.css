@@ -21,11 +21,24 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.api-config {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.api-config input {
+  min-width: 300px;
+  max-width: 50vw;
 }
 
 .layout {
   display: grid;
-  grid-template-columns: repeat(4, minmax(250px, 1fr));
+  grid-template-columns: minmax(300px, 1.2fr) repeat(3, minmax(250px, 1fr));
   gap: 12px;
   padding: 12px;
 }
@@ -45,9 +58,12 @@ body {
   margin-bottom: 8px;
 }
 
+.entry h2 { margin: 12px 0 8px; }
+.entry h2:first-child { margin-top: 0; }
+
 .row { display: flex; gap: 8px; }
 .row input[type="number"],
-.row select { max-width: 90px; }
+.row select { max-width: 140px; }
 
 .cards {
   display: grid;
@@ -75,6 +91,8 @@ body {
 .card .name { font-size: 13px; font-weight: 700; }
 .card .count { font-size: 12px; margin: 2px 0 6px; }
 .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.lock-row { display: flex; gap: 6px; align-items: center; margin-top: 6px; font-size: 12px; flex-wrap: wrap; }
+.lock-row input[type="number"] { width: 56px; }
 
 button {
   border: 1px solid var(--line);
@@ -101,10 +119,25 @@ th, td {
 }
 th:first-child, td:first-child { text-align: left; }
 
+.deck-preview {
+  margin: 8px 0;
+  border: 1px solid var(--line);
+  background: #fff;
+  border-radius: 8px;
+  padding: 8px;
+  min-height: 120px;
+  max-height: 240px;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
 @media (max-width: 1200px) {
   .layout { grid-template-columns: 1fr 1fr; }
 }
 
 @media (max-width: 760px) {
   .layout { grid-template-columns: 1fr; }
+  .api-config { width: 100%; }
+  .api-config input { min-width: 0; width: 100%; max-width: none; }
 }

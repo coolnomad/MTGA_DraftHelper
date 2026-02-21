@@ -3,6 +3,7 @@
 import csv
 import io
 import json
+import os
 import re
 import sys
 import uuid
@@ -14,6 +15,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import xgboost as xgb
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -32,12 +34,15 @@ class SessionRequest(BaseModel):
 
 class LoadPoolRequest(BaseModel):
     session_id: str
-    list_text: Optional[str] = None
-    csv_text: Optional[str] = None
     locked_list_text: Optional[str] = None
     locked_csv_text: Optional[str] = None
     wobble_list_text: Optional[str] = None
     wobble_csv_text: Optional[str] = None
+    ignored_list_text: Optional[str] = None
+    ignored_csv_text: Optional[str] = None
+    # Backward-compat aliases from earlier UI.
+    list_text: Optional[str] = None
+    csv_text: Optional[str] = None
 
 
 class MoveRequest(BaseModel):
@@ -93,6 +98,30 @@ class OptimizeBeamRequest(BaseModel):
     base_p_values: Optional[List[float]] = None
     dedupe: bool = True
     stop_if_no_improvement: bool = True
+    return_top_k: int = 5
+
+
+class ApplyDeckRequest(BaseModel):
+    session_id: str
+    deck_counts: Dict[str, int]
+
+
+class SetMinLockRequest(BaseModel):
+    session_id: str
+    card: str
+    min_count: int
+
+
+class ToggleLockAllRequest(BaseModel):
+    session_id: str
+    card: str
+    lock: bool = True
+
+
+class SetLandSwapOnlyRequest(BaseModel):
+    session_id: str
+    card: str
+    flag: bool = True
 
 
 @dataclass
@@ -102,6 +131,9 @@ class DeckBuildSession:
     pool_counts: Dict[str, int]
     locked_counts: Dict[str, int]
     wobble_counts: Dict[str, int]
+    ignored_counts: Dict[str, int]
+    min_locked_counts: Dict[str, int]
+    land_swap_only: Dict[str, bool]
 
 
 class DeckBumpScorer:
@@ -222,6 +254,53 @@ def parse_pasted_list(text: str) -> Dict[str, int]:
     return counts
 
 
+def parse_deck_and_sideboard_list(text: str) -> Dict[str, Any]:
+    deck_counts: Dict[str, int] = {}
+    sideboard_counts: Dict[str, int] = {}
+    unparsed_lines: List[str] = []
+    if not text:
+        return {
+            "deck_counts": deck_counts,
+            "sideboard_counts": sideboard_counts,
+            "unparsed_lines": unparsed_lines,
+            "has_header": False,
+        }
+
+    section = "deck"
+    has_header = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if re.match(r"^deck\b", line, flags=re.IGNORECASE):
+            section = "deck"
+            has_header = True
+            continue
+        if re.match(r"^sideboard\b", line, flags=re.IGNORECASE):
+            section = "sideboard"
+            has_header = True
+            continue
+
+        m = re.match(r"^(?:(\d+)\s+)?(.+)$", line)
+        if not m:
+            unparsed_lines.append(line)
+            continue
+        cnt = int(m.group(1)) if m.group(1) else 1
+        name = (m.group(2) or "").strip()
+        if not name:
+            unparsed_lines.append(line)
+            continue
+        target = deck_counts if section == "deck" else sideboard_counts
+        target[name] = target.get(name, 0) + clamp_count(cnt)
+
+    return {
+        "deck_counts": deck_counts,
+        "sideboard_counts": sideboard_counts,
+        "unparsed_lines": unparsed_lines,
+        "has_header": has_header,
+    }
+
+
 def parse_csv_text(csv_text: str) -> Dict[str, int]:
     counts: Dict[str, int] = {}
     if not csv_text or not csv_text.strip():
@@ -278,6 +357,9 @@ class DeckBuildService:
             pool_counts={},
             locked_counts={},
             wobble_counts={},
+            ignored_counts={},
+            min_locked_counts={},
+            land_swap_only={},
         )
         self.sessions[sid] = ses
         return ses
@@ -298,36 +380,143 @@ class DeckBuildService:
                 incoming[k] = incoming.get(k, 0) + v
         return incoming
 
+    def _unknown_cards(self, counts: Dict[str, int]) -> List[str]:
+        if not self.asset_loader or not getattr(self.asset_loader, "name_to_card", None):
+            return []
+        out = []
+        for name, cnt in counts.items():
+            if int(cnt) <= 0:
+                continue
+            if name in BASIC_LANDS:
+                continue
+            if self.asset_loader.find_by_name(name) is None:
+                out.append(name)
+        return sorted(set(out))
+
+    def _recompute_pool_counts(self, ses: DeckBuildSession) -> None:
+        merged: Dict[str, int] = {}
+        for src in (ses.locked_counts, ses.wobble_counts):
+            for k, v in src.items():
+                if int(v) > 0:
+                    merged[k] = merged.get(k, 0) + int(v)
+        ses.pool_counts = merged
+
+    def _clamp_min_locks(self, ses: DeckBuildSession) -> None:
+        for card in list(ses.min_locked_counts.keys()):
+            cur = int(ses.locked_counts.get(card, 0))
+            want = int(max(0, ses.min_locked_counts.get(card, 0)))
+            if cur <= 0 or want <= 0:
+                ses.min_locked_counts.pop(card, None)
+            elif want > cur:
+                ses.min_locked_counts[card] = cur
+
     def load_pool(
         self,
         session_id: str,
-        list_text: Optional[str],
-        csv_text: Optional[str],
         locked_list_text: Optional[str] = None,
         locked_csv_text: Optional[str] = None,
         wobble_list_text: Optional[str] = None,
         wobble_csv_text: Optional[str] = None,
-    ) -> DeckBuildSession:
+        ignored_list_text: Optional[str] = None,
+        ignored_csv_text: Optional[str] = None,
+        list_text: Optional[str] = None,
+        csv_text: Optional[str] = None,
+    ) -> Dict[str, Any]:
         ses = self.get_session(session_id)
-        pool_in = self._merge_sources(list_text, csv_text)
-        locked_in = self._merge_sources(locked_list_text, locked_csv_text)
+        warnings = {"unparsed_lines": [], "unknown_cards": []}
+        # Old payload fields map to ignored sideboard in the 3-zone model.
+        ignored_alias = self._merge_sources(None, csv_text)
+        locked_in = self._merge_sources(None, locked_csv_text)
         wobble_in = self._merge_sources(wobble_list_text, wobble_csv_text)
+        ignored_in = self._merge_sources(ignored_list_text, ignored_csv_text)
 
-        has_explicit_locked_or_wobble = bool(locked_in) or bool(wobble_in)
-        if has_explicit_locked_or_wobble:
-            ses.pool_counts = pool_in
-            ses.locked_counts = locked_in
-            ses.wobble_counts = wobble_in
+        parsed_main = parse_deck_and_sideboard_list(locked_list_text or "")
+        if parsed_main["has_header"]:
+            for k, v in parsed_main["deck_counts"].items():
+                locked_in[k] = locked_in.get(k, 0) + v
+            for k, v in parsed_main["sideboard_counts"].items():
+                wobble_in[k] = wobble_in.get(k, 0) + v
+            warnings["unparsed_lines"].extend(parsed_main["unparsed_lines"])
         else:
-            # Backward-compatible behavior: load all as pool, clear locked/wobble.
-            ses.pool_counts = pool_in
-            ses.locked_counts = {}
-            ses.wobble_counts = {}
-        return ses
+            for k, v in parse_pasted_list(locked_list_text or "").items():
+                locked_in[k] = locked_in.get(k, 0) + v
+
+        parsed_alias = parse_deck_and_sideboard_list(list_text or "")
+        if parsed_alias["has_header"]:
+            for k, v in parsed_alias["deck_counts"].items():
+                locked_in[k] = locked_in.get(k, 0) + v
+            for k, v in parsed_alias["sideboard_counts"].items():
+                wobble_in[k] = wobble_in.get(k, 0) + v
+            warnings["unparsed_lines"].extend(parsed_alias["unparsed_lines"])
+        else:
+            for k, v in parse_pasted_list(list_text or "").items():
+                ignored_alias[k] = ignored_alias.get(k, 0) + v
+
+        if ignored_alias:
+            for k, v in ignored_alias.items():
+                ignored_in[k] = ignored_in.get(k, 0) + v
+
+        all_counts: Dict[str, int] = {}
+        for src in (locked_in, wobble_in, ignored_in):
+            for k, v in src.items():
+                all_counts[k] = all_counts.get(k, 0) + int(v)
+        warnings["unknown_cards"] = self._unknown_cards(all_counts)
+
+        ses.locked_counts = locked_in
+        ses.wobble_counts = wobble_in
+        ses.ignored_counts = ignored_in
+        self._recompute_pool_counts(ses)
+        # Loading a new deck context resets per-card constraints.
+        ses.min_locked_counts = {}
+        ses.land_swap_only = {}
+        return {"session": ses, "warnings": warnings}
 
     def set_base_p(self, session_id: str, base_p_user: float) -> DeckBuildSession:
         ses = self.get_session(session_id)
         ses.base_p_user = float(base_p_user)
+        return ses
+
+    def _min_lock_for(self, ses: DeckBuildSession, card: str) -> int:
+        return int(max(0, ses.min_locked_counts.get(card, 0)))
+
+    def _can_remove_from_deck(self, deck_counts: Dict[str, int], ses: DeckBuildSession, card: str) -> bool:
+        return int(deck_counts.get(card, 0)) > self._min_lock_for(ses, card)
+
+    def _is_land_swap_only(self, ses: DeckBuildSession, card: str) -> bool:
+        return bool(ses.land_swap_only.get(card, False))
+
+    def set_min_lock(self, session_id: str, card: str, min_count: int) -> DeckBuildSession:
+        ses = self.get_session(session_id)
+        if int(min_count) < 0:
+            raise HTTPException(status_code=400, detail="min_count must be >= 0")
+        cur = int(ses.locked_counts.get(card, 0))
+        m = int(min_count)
+        if cur > 0 and m > cur:
+            m = cur
+        if m <= 0:
+            ses.min_locked_counts.pop(card, None)
+        else:
+            ses.min_locked_counts[card] = m
+        return ses
+
+    def toggle_lock_all(self, session_id: str, card: str, lock: bool) -> DeckBuildSession:
+        ses = self.get_session(session_id)
+        if lock:
+            m = int(ses.locked_counts.get(card, 0))
+            if m > 0:
+                ses.min_locked_counts[card] = m
+            else:
+                ses.min_locked_counts.pop(card, None)
+        else:
+            ses.min_locked_counts.pop(card, None)
+        return ses
+
+    def set_land_swap_only(self, session_id: str, card: str, flag: bool) -> DeckBuildSession:
+        ses = self.get_session(session_id)
+        if flag:
+            ses.land_swap_only[card] = True
+        else:
+            ses.land_swap_only.pop(card, None)
         return ses
 
     def _take(self, zone: Dict[str, int], card: str, n: int = 1) -> bool:
@@ -346,31 +535,54 @@ class DeckBuildService:
 
     def move(self, session_id: str, card: str, from_zone: str, to_zone: str) -> DeckBuildSession:
         ses = self.get_session(session_id)
-        from_zone = from_zone.lower()
-        to_zone = to_zone.lower()
-        if from_zone not in {"pool", "locked", "wobble"}:
-            raise HTTPException(status_code=400, detail="from_zone must be pool|locked|wobble")
-        if to_zone not in {"pool", "locked", "wobble"}:
-            raise HTTPException(status_code=400, detail="to_zone must be pool|locked|wobble")
+        alias = {
+            "main": "locked",
+            "locked": "locked",
+            "swappable": "wobble",
+            "wobble": "wobble",
+            "ignorable": "ignored",
+            "ignored": "ignored",
+            "pool": "pool",
+        }
+        from_zone = alias.get((from_zone or "").lower(), (from_zone or "").lower())
+        to_zone = alias.get((to_zone or "").lower(), (to_zone or "").lower())
+        if from_zone not in {"pool", "locked", "wobble", "ignored"}:
+            raise HTTPException(status_code=400, detail="from_zone must be pool|locked|wobble|ignored")
+        if to_zone not in {"locked", "wobble", "ignored"}:
+            raise HTTPException(status_code=400, detail="to_zone must be locked|wobble|ignored")
         if from_zone == to_zone:
             return ses
 
         is_basic = card in BASIC_LANDS
-        zones = {"pool": ses.pool_counts, "locked": ses.locked_counts, "wobble": ses.wobble_counts}
+        zones = {"locked": ses.locked_counts, "wobble": ses.wobble_counts, "ignored": ses.ignored_counts}
 
         if from_zone == "pool" and to_zone == "locked" and is_basic:
             self._put(ses.locked_counts, card, 1)
+            self._recompute_pool_counts(ses)
+            self._clamp_min_locks(ses)
             return ses
+
+        # Movement rules:
+        # allowed: locked<->wobble, wobble<->ignored, locked->ignored
+        # not allowed: ignored->locked directly.
+        allowed = {
+            ("locked", "wobble"),
+            ("wobble", "locked"),
+            ("wobble", "ignored"),
+            ("ignored", "wobble"),
+            ("locked", "ignored"),
+        }
+        if (from_zone, to_zone) not in allowed:
+            raise HTTPException(status_code=400, detail=f"move {from_zone}->{to_zone} is not allowed")
 
         src = zones[from_zone]
         dst = zones[to_zone]
         if not self._take(src, card, 1):
             raise HTTPException(status_code=400, detail=f"card not available in {from_zone}")
 
-        if to_zone == "pool" and is_basic:
-            return ses
-
         self._put(dst, card, 1)
+        self._recompute_pool_counts(ses)
+        self._clamp_min_locks(ses)
         return ses
 
     def evaluate(self, session_id: str, base_p_values: Optional[List[float]]) -> Dict:
@@ -522,13 +734,18 @@ class DeckBuildService:
         ses = self.get_session(session_id)
         base_vals = [float(v) for v in (base_p_values or [0.4, 0.5, 0.6, ses.base_p_user])]
         current_deck, warnings = self._deck_for_eval(ses.locked_counts)
-        current_preds = self.scorer.predict_many(current_deck, base_vals)
-        current_rank = self._rank_score(current_preds, rank_mode, ses.base_p_user)
+        current_score = self._score_decks([current_deck], base_vals, rank_mode, ses.base_p_user)[0]
+        current_preds = current_score["predictions"]
+        current_rank = float(current_score["rank_score"])
 
         if removable_cards:
-            removable_raw = [c for c in removable_cards if current_deck.get(c, 0) > 0]
+            removable_raw = [c for c in removable_cards if self._can_remove_from_deck(current_deck, ses, c)]
         else:
-            removable_raw = [c for c, n in current_deck.items() if n > 0 and c not in BASIC_LANDS]
+            removable_raw = [
+                c
+                for c, n in current_deck.items()
+                if n > 0 and c not in BASIC_LANDS and self._can_remove_from_deck(current_deck, ses, c)
+            ]
 
         removable_nom: List[Dict[str, float]] = []
         removable_pool: List[str] = []
@@ -536,6 +753,8 @@ class DeckBuildService:
             rem_decks: List[Dict[str, int]] = []
             rem_cards: List[str] = []
             for r in removable_raw:
+                if not self._can_remove_from_deck(current_deck, ses, r):
+                    continue
                 nd = dict(current_deck)
                 nd[r] -= 1
                 if nd[r] <= 0:
@@ -554,6 +773,8 @@ class DeckBuildService:
                 removable_pool = [r["card"] for r in removable_nom][: max(1, int(max_removables))]
             else:
                 removable_pool = [r["card"] for r in removable_nom if r["delta_remove"] > 0][: max(1, int(max_removables))]
+        else:
+            warnings.append("No removable cards available due to min locks")
 
         addable = [c for c, n in ses.wobble_counts.items() if n > 0 and c not in BASIC_LANDS]
         if include_basic_adds:
@@ -565,8 +786,12 @@ class DeckBuildService:
             for a in addable:
                 if a == r:
                     continue
+                if self._is_land_swap_only(ses, a) and r not in BASIC_LANDS:
+                    continue
+                if self._is_land_swap_only(ses, r) and a not in BASIC_LANDS:
+                    continue
                 nd = dict(current_deck)
-                if nd.get(r, 0) <= 0:
+                if nd.get(r, 0) <= 0 or not self._can_remove_from_deck(nd, ses, r):
                     continue
                 nd[r] -= 1
                 if nd[r] <= 0:
@@ -648,6 +873,8 @@ class DeckBuildService:
                 if ses.wobble_counts.get(add_card, 0) <= 0:
                     ses.wobble_counts.pop(add_card, None)
             ses.wobble_counts[remove_card] = ses.wobble_counts.get(remove_card, 0) + 1
+            self._recompute_pool_counts(ses)
+            self._clamp_min_locks(ses)
             applied.append(
                 {
                     "step": step + 1,
@@ -674,12 +901,35 @@ class DeckBuildService:
         }
 
     def _pool_limit(self, ses: DeckBuildSession, card: str) -> int:
-        return int(
-            max(
-                ses.pool_counts.get(card, 0),
-                ses.locked_counts.get(card, 0) + ses.wobble_counts.get(card, 0),
-            )
-        )
+        return int(max(0, ses.pool_counts.get(card, 0)))
+
+    def apply_locked_deck(self, session_id: str, deck_counts: Dict[str, int]) -> DeckBuildSession:
+        ses = self.get_session(session_id)
+        old_pool = {k: int(v) for k, v in ses.pool_counts.items() if int(v) > 0}
+        target_locked: Dict[str, int] = {}
+        for card, raw in (deck_counts or {}).items():
+            cnt = clamp_count(raw)
+            if cnt <= 0:
+                continue
+            if card not in BASIC_LANDS:
+                cnt = min(cnt, int(old_pool.get(card, 0)))
+                if cnt <= 0:
+                    continue
+            target_locked[card] = target_locked.get(card, 0) + cnt
+
+        new_wobble: Dict[str, int] = {}
+        for card, avail in old_pool.items():
+            if avail <= 0:
+                continue
+            rem = int(avail) - int(target_locked.get(card, 0))
+            if rem > 0:
+                new_wobble[card] = rem
+
+        ses.locked_counts = target_locked
+        ses.wobble_counts = new_wobble
+        self._recompute_pool_counts(ses)
+        self._clamp_min_locks(ses)
+        return ses
 
     def optimize_beam(
         self,
@@ -696,6 +946,7 @@ class DeckBuildService:
         base_p_values: Optional[List[float]] = None,
         dedupe: bool = True,
         stop_if_no_improvement: bool = True,
+        return_top_k: int = 5,
     ) -> Dict[str, Any]:
         ses = self.get_session(session_id)
         base_vals = [float(v) for v in (base_p_values or [0.4, 0.5, 0.6, ses.base_p_user])]
@@ -713,6 +964,7 @@ class DeckBuildService:
 
         mode_rem = (mode_removable or "auto").lower()
         manual_rem = set(removable_cards or [])
+        no_removable_due_locks = False
 
         for step_i in range(1, max(1, int(steps)) + 1):
             all_children: List[Dict[str, Any]] = []
@@ -721,12 +973,17 @@ class DeckBuildService:
                 p_score = float(parent["score"]["rank_score"])
 
                 if mode_rem == "manual" and manual_rem:
-                    rem_cards = [c for c in sorted(manual_rem) if p_deck.get(c, 0) > 0]
+                    rem_cards = [c for c in sorted(manual_rem) if self._can_remove_from_deck(p_deck, ses, c)]
                     rem_nom = [{"card": c, "delta_remove": 0.0} for c in rem_cards]
                 else:
-                    cand = sorted([c for c, n in p_deck.items() if n > 0], key=lambda x: (-p_deck[x], x))[:40]
+                    cand = sorted(
+                        [c for c, n in p_deck.items() if n > 0 and self._can_remove_from_deck(p_deck, ses, c)],
+                        key=lambda x: (-p_deck[x], x),
+                    )[:40]
                     rem_decks: List[Dict[str, int]] = []
                     for c in cand:
+                        if not self._can_remove_from_deck(p_deck, ses, c):
+                            continue
                         nd = dict(p_deck)
                         nd[c] -= 1
                         if nd[c] <= 0:
@@ -740,14 +997,20 @@ class DeckBuildService:
                         rem_nom.append({"card": c, "delta_remove": float(s["rank_score"] - p_score)})
                     rem_nom.sort(key=lambda x: x["delta_remove"], reverse=True)
                     rem_cards = [x["card"] for x in rem_nom[: max(1, int(R))]]
+                if not rem_cards:
+                    no_removable_due_locks = True
 
                 cand_decks: List[Dict[str, int]] = []
                 cand_moves: List[Dict[str, str]] = []
                 for r in rem_cards:
-                    if p_deck.get(r, 0) <= 0:
+                    if p_deck.get(r, 0) <= 0 or not self._can_remove_from_deck(p_deck, ses, r):
                         continue
                     for a in addable:
                         if a == r:
+                            continue
+                        if self._is_land_swap_only(ses, a) and r not in BASIC_LANDS:
+                            continue
+                        if self._is_land_swap_only(ses, r) and a not in BASIC_LANDS:
                             continue
                         nd = dict(p_deck)
                         nd[r] -= 1
@@ -796,6 +1059,8 @@ class DeckBuildService:
                     )
 
             if not all_children:
+                if no_removable_due_locks:
+                    warnings.append("No removable cards available due to min locks")
                 break
 
             if dedupe:
@@ -818,17 +1083,41 @@ class DeckBuildService:
                 #break
                 continue
 
+        final_candidates = list(beam) if beam else [best]
+        final_by_key: Dict[tuple, Dict[str, Any]] = {}
+        for node in final_candidates:
+            d_key = self._deck_key(node["deck_counts"])
+            prev = final_by_key.get(d_key)
+            if prev is None or float(node["score"]["rank_score"]) > float(prev["score"]["rank_score"]):
+                final_by_key[d_key] = node
+        final_sorted = sorted(final_by_key.values(), key=lambda x: float(x["score"]["rank_score"]), reverse=True)
+        top_nodes = final_sorted[: max(1, int(return_top_k))]
+        best_node = top_nodes[0] if top_nodes else best
+
+        top_decks = []
+        for idx, node in enumerate(top_nodes, start=1):
+            top_decks.append(
+                {
+                    "rank": idx,
+                    "rank_score": float(node["score"]["rank_score"]),
+                    "predictions": node["score"]["predictions"],
+                    "deck_counts": node["deck_counts"],
+                    "path": node["path"],
+                }
+            )
+
         return {
             "start": {
                 "rank_score": float(start_score["rank_score"]),
                 "predictions": start_score["predictions"],
             },
             "best": {
-                "rank_score": float(best["score"]["rank_score"]),
-                "predictions": best["score"]["predictions"],
-                "deck_counts": best["deck_counts"],
+                "rank_score": float(best_node["score"]["rank_score"]),
+                "predictions": best_node["score"]["predictions"],
+                "deck_counts": best_node["deck_counts"],
             },
-            "path": best["path"],
+            "top_decks": top_decks,
+            "path": best_node["path"],
             "trajectory": trajectory,
             "warnings": warnings,
         }
@@ -859,12 +1148,25 @@ class DeckBuildService:
             "pool": self._serialize_zone(ses.pool_counts),
             "locked": self._serialize_zone(ses.locked_counts),
             "wobble": self._serialize_zone(ses.wobble_counts),
+            "ignored": self._serialize_zone(ses.ignored_counts),
             "basics": self._serialize_zone({b: ses.locked_counts.get(b, 0) for b in sorted(BASIC_LANDS)}),
             "deck_count": int(sum(ses.locked_counts.values())),
+            "min_locked_counts": dict(ses.min_locked_counts),
+            "land_swap_only": dict(ses.land_swap_only),
         }
 
 
 app = FastAPI()
+cors_origins_raw = os.getenv("DECKBUILD_UI_CORS_ORIGINS", "*").strip()
+cors_origins = [x.strip() for x in cors_origins_raw.split(",") if x.strip()]
+if cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 asset_loader = CardAssetLoader()
 scorer = DeckBumpScorer()
 service = DeckBuildService(asset_loader=asset_loader, scorer=scorer)
@@ -895,16 +1197,20 @@ def get_state(session_id: str):
 
 @app.post("/api/load_pool")
 def load_pool(req: LoadPoolRequest):
-    ses = service.load_pool(
+    out = service.load_pool(
         req.session_id,
-        req.list_text,
-        req.csv_text,
         req.locked_list_text,
         req.locked_csv_text,
         req.wobble_list_text,
         req.wobble_csv_text,
+        req.ignored_list_text,
+        req.ignored_csv_text,
+        req.list_text,
+        req.csv_text,
     )
-    return service.state(ses.session_id)
+    state = service.state(out["session"].session_id)
+    state["parse_warnings"] = out.get("warnings", {"unparsed_lines": [], "unknown_cards": []})
+    return state
 
 
 @app.post("/api/move")
@@ -920,6 +1226,24 @@ def move(req: MoveRequest):
 @app.post("/api/set_base_p")
 def set_base_p(req: BasePRequest):
     ses = service.set_base_p(req.session_id, req.base_p_user)
+    return service.state(ses.session_id)
+
+
+@app.post("/api/set_min_lock")
+def set_min_lock(req: SetMinLockRequest):
+    ses = service.set_min_lock(req.session_id, req.card, req.min_count)
+    return service.state(ses.session_id)
+
+
+@app.post("/api/toggle_lock_all")
+def toggle_lock_all(req: ToggleLockAllRequest):
+    ses = service.toggle_lock_all(req.session_id, req.card, req.lock)
+    return service.state(ses.session_id)
+
+
+@app.post("/api/set_land_swap_only")
+def set_land_swap_only(req: SetLandSwapOnlyRequest):
+    ses = service.set_land_swap_only(req.session_id, req.card, req.flag)
     return service.state(ses.session_id)
 
 
@@ -970,7 +1294,14 @@ def optimize_beam(req: OptimizeBeamRequest):
         base_p_values=req.base_p_values,
         dedupe=req.dedupe,
         stop_if_no_improvement=req.stop_if_no_improvement,
+        return_top_k=req.return_top_k,
     )
+
+
+@app.post("/api/apply_optimized_deck")
+def apply_optimized_deck(req: ApplyDeckRequest):
+    ses = service.apply_locked_deck(req.session_id, req.deck_counts)
+    return service.state(ses.session_id)
 
 
 if __name__ == "__main__":
