@@ -1,0 +1,65 @@
+name: Deploy Deckbuild Backend (Koyeb)
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "scripts/run_deckbuild_ui.py"
+      - "scripts/pod_assets.py"
+      - "requirements.txt"
+      - "model/**"
+      - "models/**"
+      - ".github/workflows/deploy-deckbuild-backend-koyeb.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "deckbuild-backend-koyeb"
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate required secrets and variables
+        shell: bash
+        env:
+          KOYEB_API_TOKEN: ${{ secrets.KOYEB_API_TOKEN }}
+          KOYEB_APP_NAME: ${{ vars.KOYEB_APP_NAME }}
+          KOYEB_SERVICE_NAME: ${{ vars.KOYEB_SERVICE_NAME }}
+        run: |
+          if [ -z "$KOYEB_API_TOKEN" ]; then
+            echo "Missing required GitHub secret: KOYEB_API_TOKEN"
+            exit 1
+          fi
+          if [ -z "$KOYEB_APP_NAME" ]; then
+            echo "Missing required GitHub variable: KOYEB_APP_NAME"
+            exit 1
+          fi
+          if [ -z "$KOYEB_SERVICE_NAME" ]; then
+            echo "Missing required GitHub variable: KOYEB_SERVICE_NAME"
+            exit 1
+          fi
+
+      - name: Install and configure Koyeb CLI
+        uses: koyeb-community/koyeb-actions@v2
+        with:
+          api_token: ${{ secrets.KOYEB_API_TOKEN }}
+
+      - name: Deploy to Koyeb
+        uses: koyeb/action-git-deploy@v1
+        with:
+          app-name: ${{ vars.KOYEB_APP_NAME }}
+          service-name: ${{ vars.KOYEB_SERVICE_NAME }}
+          service-type: web
+          service-instance-type: nano
+          service-regions: ${{ vars.KOYEB_REGION || 'was' }}
+          service-env: PORT=8000
+          service-ports: "8000:http"
+          service-routes: "/:8000"
+          service-checks: "8000:http:/"
+          git-branch: main
+          git-builder: buildpack
+          git-run-command: uvicorn scripts.run_deckbuild_ui:app --host 0.0.0.0 --port 8000

@@ -15,6 +15,7 @@ You still need a hosted backend API for endpoints like `/api/session`, `/api/loa
 
 For automated backend deploys, see:
 - `docs/deckbuild_backend_render_deploy.md`
+- `docs/deckbuild_backend_koyeb_deploy.md`
 
 ## Configure the backend URL in the UI
 
