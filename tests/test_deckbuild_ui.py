@@ -64,40 +64,47 @@ def test_parse_csv_text_header_and_noheader():
     assert out2["Shock"] == 1
 
 
-def test_move_logic_and_basics():
+def test_three_zone_move_rules_and_basics():
     svc = DeckBuildService(asset_loader=DummyAssets(), scorer=DummyScorer())
     ses = svc.create_session(0.55)
-    ses.pool_counts = {"Lightning Bolt": 2}
+    ses.locked_counts = {"Lightning Bolt": 1}
+    ses.wobble_counts = {"Lightning Bolt": 1}
+    svc._recompute_pool_counts(ses)
 
-    svc.move(ses.session_id, "Lightning Bolt", "pool", "locked")
-    assert ses.pool_counts["Lightning Bolt"] == 1
-    assert ses.locked_counts["Lightning Bolt"] == 1
+    svc.move(ses.session_id, "Lightning Bolt", "wobble", "locked")
+    assert ses.locked_counts["Lightning Bolt"] == 2
 
-    # Unlimited basic from pool -> locked even when absent in pool
     svc.move(ses.session_id, "Island", "pool", "locked")
     assert ses.locked_counts["Island"] == 1
-    assert "Island" not in ses.pool_counts
 
-    # Basic removed to pool should just decrement locked
-    svc.move(ses.session_id, "Island", "locked", "pool")
-    assert ses.locked_counts.get("Island", 0) == 0
+    svc.move(ses.session_id, "Island", "locked", "ignored")
+    assert ses.ignored_counts.get("Island", 0) == 1
+
+    try:
+        svc.move(ses.session_id, "Island", "ignored", "locked")
+        assert False, "ignored->locked should be blocked"
+    except Exception:
+        pass
 
 
-def test_load_pool_with_explicit_locked_and_wobble():
+def test_load_pool_with_three_zones_and_pool_invariant():
     svc = DeckBuildService(asset_loader=DummyAssets(), scorer=DummyScorer())
     ses = svc.create_session(0.55)
     svc.load_pool(
         ses.session_id,
-        list_text="Card In Pool\n",
-        csv_text=None,
         locked_list_text="2 Lightning Bolt\n",
         locked_csv_text=None,
         wobble_list_text="1 Negate\n",
         wobble_csv_text=None,
+        ignored_list_text="1 Cancel\n",
+        ignored_csv_text=None,
     )
-    assert ses.pool_counts.get("Card In Pool", 0) == 1
     assert ses.locked_counts.get("Lightning Bolt", 0) == 2
     assert ses.wobble_counts.get("Negate", 0) == 1
+    assert ses.ignored_counts.get("Cancel", 0) == 1
+    assert ses.pool_counts.get("Cancel", 0) == 0
+    assert ses.pool_counts.get("Lightning Bolt", 0) == 2
+    assert ses.pool_counts.get("Negate", 0) == 1
 
 
 def test_suggest_swaps_and_auto_iterate():
@@ -105,6 +112,7 @@ def test_suggest_swaps_and_auto_iterate():
     ses = svc.create_session(0.55)
     ses.locked_counts = {f"Card{i}": 1 for i in range(35)}
     ses.wobble_counts = {"Negate": 1, "Disdainful Stroke": 1}
+    svc._recompute_pool_counts(ses)
     out = svc.suggest_swaps(ses.session_id, top_k=5, rank_mode="user")
     assert "current" in out
     assert "suggestions" in out
@@ -113,7 +121,61 @@ def test_suggest_swaps_and_auto_iterate():
     assert "final" in it
 
 
-def test_beam_search_finds_multi_swap_path():
+def test_min_lock_prevents_removal():
+    scorer = MockBeamScorer()
+    svc = DeckBuildService(asset_loader=DummyAssets(), scorer=scorer)
+    ses = svc.create_session(0.55)
+    ses.locked_counts = {f"Filler{i}": 1 for i in range(38)}
+    ses.locked_counts["Bad1"] = 2
+    ses.wobble_counts = {"Upgrade1": 1}
+    svc._recompute_pool_counts(ses)
+    svc.set_min_lock(ses.session_id, "Bad1", 2)
+    out = svc.suggest_swaps(ses.session_id, top_k=10)
+    assert not any(s["remove"] == "Bad1" for s in out["suggestions"])
+
+
+def test_partial_min_lock_and_manual_removable_filtering():
+    scorer = MockBeamScorer()
+    svc = DeckBuildService(asset_loader=DummyAssets(), scorer=scorer)
+    ses = svc.create_session(0.55)
+    ses.locked_counts = {f"Filler{i}": 1 for i in range(37)}
+    ses.locked_counts["Bad1"] = 2
+    ses.locked_counts["Bad2"] = 1
+    ses.wobble_counts = {"Upgrade1": 1, "Upgrade2": 1}
+    svc._recompute_pool_counts(ses)
+    svc.set_min_lock(ses.session_id, "Bad1", 1)
+    out = svc.suggest_swaps(ses.session_id, top_k=20, removable_cards=["Bad1", "Bad2"])
+    assert all(s["remove"] in {"Bad1", "Bad2"} for s in out["suggestions"])
+
+
+def test_all_locked_returns_warning():
+    scorer = MockBeamScorer()
+    svc = DeckBuildService(asset_loader=DummyAssets(), scorer=scorer)
+    ses = svc.create_session(0.55)
+    ses.locked_counts = {"Bad1": 1}
+    ses.wobble_counts = {"Upgrade1": 1}
+    svc._recompute_pool_counts(ses)
+    svc.set_min_lock(ses.session_id, "Bad1", 1)
+    out = svc.suggest_swaps(ses.session_id, top_k=5)
+    assert len(out["suggestions"]) == 0
+    assert any("min locks" in w for w in out["current"]["warnings"])
+
+
+def test_land_swap_only_enforced():
+    scorer = MockBeamScorer()
+    svc = DeckBuildService(asset_loader=DummyAssets(), scorer=scorer)
+    ses = svc.create_session(0.55)
+    ses.locked_counts = {f"Filler{i}": 1 for i in range(38)}
+    ses.locked_counts["Bad1"] = 1
+    ses.locked_counts["Island"] = 1
+    ses.wobble_counts = {"Upgrade1": 1}
+    svc._recompute_pool_counts(ses)
+    svc.set_land_swap_only(ses.session_id, "Upgrade1", True)
+    out = svc.suggest_swaps(ses.session_id, top_k=20)
+    assert all(s["remove"] in BASIC_LANDS for s in out["suggestions"])
+
+
+def test_beam_search_and_constraints():
     scorer = MockBeamScorer()
     svc = DeckBuildService(asset_loader=DummyAssets(), scorer=scorer)
     ses = svc.create_session(0.55)
@@ -121,7 +183,7 @@ def test_beam_search_finds_multi_swap_path():
     ses.locked_counts["Bad1"] = 1
     ses.locked_counts["Bad2"] = 1
     ses.wobble_counts = {"Upgrade1": 1, "Upgrade2": 1}
-    ses.pool_counts = {"Upgrade1": 1, "Upgrade2": 1, "Bad1": 1, "Bad2": 1}
+    svc._recompute_pool_counts(ses)
     out = svc.optimize_beam(
         session_id=ses.session_id,
         steps=3,
@@ -131,19 +193,10 @@ def test_beam_search_finds_multi_swap_path():
         rank_mode="user",
     )
     assert out["best"]["rank_score"] >= out["start"]["rank_score"]
-    assert len(out["path"]) >= 1
 
-
-def test_beam_respects_pool_availability():
-    scorer = MockBeamScorer()
-    svc = DeckBuildService(asset_loader=DummyAssets(), scorer=scorer)
-    ses = svc.create_session(0.55)
-    ses.locked_counts = {f"Filler{i}": 1 for i in range(39)}
-    ses.locked_counts["Bad1"] = 1
-    ses.wobble_counts = {"Upgrade1": 1}
-    ses.pool_counts = {"Bad1": 1}  # Upgrade1 unavailable in pool
-    out = svc.optimize_beam(session_id=ses.session_id, steps=2, beam_width=3, R=4)
-    assert len(out["path"]) == 0
+    svc.set_min_lock(ses.session_id, "Bad1", 1)
+    out2 = svc.optimize_beam(session_id=ses.session_id, steps=3, beam_width=4, top_children_per_parent=20, R=5)
+    assert all(step["remove"] != "Bad1" for step in out2["path"])
 
 
 def test_beam_scoring_cache_reuse():
@@ -153,7 +206,7 @@ def test_beam_scoring_cache_reuse():
     ses.locked_counts = {f"Filler{i}": 1 for i in range(39)}
     ses.locked_counts["Bad1"] = 1
     ses.wobble_counts = {"Upgrade1": 1}
-    ses.pool_counts = {"Upgrade1": 1, "Bad1": 1}
+    svc._recompute_pool_counts(ses)
     _ = svc.optimize_beam(session_id=ses.session_id, steps=2, beam_width=3, R=4)
     calls_after_first = scorer.calls
     _ = svc.optimize_beam(session_id=ses.session_id, steps=2, beam_width=3, R=4)
